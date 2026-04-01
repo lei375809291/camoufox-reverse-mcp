@@ -16,6 +16,19 @@ def get_font_fallback_script() -> str:
     return _read_hook_template("font_fallback.js")
 
 
+def _render_template(template_name: str, **kwargs) -> str:
+    """Render a JS template with placeholder substitution."""
+    template = _read_hook_template(template_name)
+    js = template
+    for key, value in kwargs.items():
+        placeholder = "{{" + key + "}}"
+        if isinstance(value, bool):
+            js = js.replace(placeholder, "true" if value else "false")
+        else:
+            js = js.replace(placeholder, str(value))
+    return js
+
+
 def render_trace_template(
     function_path: str,
     max_captures: int = 50,
@@ -23,22 +36,30 @@ def render_trace_template(
     log_return: bool = True,
     log_stack: bool = False,
 ) -> str:
-    """Render the trace_template.js with the given parameters.
+    """Render the trace_template.js with the given parameters."""
+    return _render_template(
+        "trace_template.js",
+        FUNCTION_PATH=function_path,
+        MAX_CAPTURES=max_captures,
+        LOG_ARGS=log_args,
+        LOG_RETURN=log_return,
+        LOG_STACK=log_stack,
+    )
 
-    Args:
-        function_path: Full path to the target function.
-        max_captures: Maximum number of calls to capture.
-        log_args: Whether to log function arguments.
-        log_return: Whether to log return values.
-        log_stack: Whether to log call stacks.
 
-    Returns:
-        Rendered JavaScript code string ready for injection.
-    """
-    template = _read_hook_template("trace_template.js")
-    js = template.replace("{{FUNCTION_PATH}}", function_path)
-    js = js.replace("{{MAX_CAPTURES}}", str(max_captures))
-    js = js.replace("{{LOG_ARGS}}", "true" if log_args else "false")
-    js = js.replace("{{LOG_RETURN}}", "true" if log_return else "false")
-    js = js.replace("{{LOG_STACK}}", "true" if log_stack else "false")
-    return js
+def render_persistent_trace_template(
+    function_path: str,
+    max_captures: int = 50,
+    log_args: bool = True,
+    log_return: bool = True,
+    log_stack: bool = False,
+) -> str:
+    """Render the persistent trace template that emits data via console.log."""
+    return _render_template(
+        "trace_persistent_template.js",
+        FUNCTION_PATH=function_path,
+        MAX_CAPTURES=max_captures,
+        LOG_ARGS=log_args,
+        LOG_RETURN=log_return,
+        LOG_STACK=log_stack,
+    )

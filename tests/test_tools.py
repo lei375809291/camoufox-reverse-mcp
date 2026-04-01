@@ -45,6 +45,20 @@ def test_truncate_str_long():
     assert "chars total" in result
 
 
+def test_render_persistent_trace_template():
+    from camoufox_reverse_mcp.utils.js_helpers import render_persistent_trace_template
+    js = render_persistent_trace_template(
+        function_path="XMLHttpRequest.prototype.open",
+        max_captures=20,
+        log_args=True,
+        log_return=True,
+        log_stack=True,
+    )
+    assert "XMLHttpRequest.prototype.open" in js
+    assert "__MCP_TRACE__" in js
+    assert "20" in js
+
+
 def test_hook_files_exist():
     hooks_dir = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
@@ -57,6 +71,9 @@ def test_hook_files_exist():
         "websocket_hook.js",
         "debugger_trap.js",
         "trace_template.js",
+        "trace_persistent_template.js",
+        "property_access_hook.js",
+        "jsvmp_hook.js",
     ]
     for f in expected_files:
         assert os.path.exists(os.path.join(hooks_dir, f)), f"Missing hook file: {f}"

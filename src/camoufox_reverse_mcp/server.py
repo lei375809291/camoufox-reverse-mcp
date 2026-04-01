@@ -5,9 +5,10 @@ mcp = FastMCP(
     "camoufox-reverse-mcp",
     instructions="Anti-detection browser MCP server for JavaScript reverse engineering. "
     "Uses Camoufox (C++ engine-level fingerprint spoofing) to bypass bot detection "
-    "while performing JS analysis, debugging, hooking, and network interception."
+    "while performing JS analysis, debugging, hooking, network interception, "
+    "and JSVMP bytecode analysis."
 )
 
 browser_manager = BrowserManager()
 
-from .tools import navigation, script_analysis, debugging, hooking, network, storage, fingerprint  # noqa: E402, F401
+from .tools import navigation, script_analysis, debugging, hooking, network, storage, fingerprint, jsvmp  # noqa: E402, F401

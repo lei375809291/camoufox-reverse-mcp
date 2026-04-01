@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os as _os
 import platform
 import time
@@ -8,7 +9,8 @@ from typing import Any
 
 from playwright.async_api import Page, BrowserContext
 
-MAX_LOG_SIZE = 500
+MAX_LOG_SIZE = 2000
+MAX_BODY_SIZE = 200_000
 
 
 def detect_host_os() -> str:
@@ -43,9 +45,13 @@ class BrowserManager:
         self._cm = None  # AsyncCamoufox context manager
         self._console_logs: deque[dict] = deque(maxlen=MAX_LOG_SIZE)
         self._network_requests: deque[dict] = deque(maxlen=MAX_LOG_SIZE)
+        self._request_id_counter = 0
         self._capturing = False
         self._capture_pattern: str = "**/*"
+        self._capture_body = False
         self._init_scripts: list[str] = []
+        self._persistent_scripts: list[dict] = []
+        self._persistent_traces: dict[str, list] = {}
 
     async def launch(self, config: dict | None = None) -> dict:
         """Launch the Camoufox browser with the given or default config."""
@@ -94,6 +100,9 @@ class BrowserManager:
             from .utils.js_helpers import get_font_fallback_script
             await ctx.add_init_script(get_font_fallback_script())
 
+        for script_info in self._persistent_scripts:
+            await ctx.add_init_script(script=script_info["content"])
+
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         self._attach_listeners(page)
         self.pages["default"] = page
@@ -112,16 +121,44 @@ class BrowserManager:
         if self.browser is None:
             await self.launch()
 
+    async def add_persistent_script(self, name: str, content: str) -> None:
+        """Register a script that persists across all navigations via context-level injection."""
+        for s in self._persistent_scripts:
+            if s["name"] == name:
+                s["content"] = content
+                break
+        else:
+            self._persistent_scripts.append({"name": name, "content": content})
+        for ctx in self.contexts.values():
+            await ctx.add_init_script(script=content)
+
+    def remove_persistent_script(self, name: str) -> bool:
+        """Remove a persistent script by name. Returns True if found."""
+        before = len(self._persistent_scripts)
+        self._persistent_scripts = [s for s in self._persistent_scripts if s["name"] != name]
+        return len(self._persistent_scripts) < before
+
     def _attach_listeners(self, page: Page) -> None:
-        """Attach console and network listeners to a page."""
+        """Attach console, network, and trace-collection listeners to a page."""
         page.on("console", self._on_console)
         page.on("request", self._on_request)
-        page.on("response", self._on_response)
+        page.on("response", self._on_response_async)
 
     def _on_console(self, msg) -> None:
+        text = msg.text
+        if text and text.startswith("__MCP_TRACE__:"):
+            try:
+                import json
+                payload = json.loads(text[len("__MCP_TRACE__:"):])
+                path = payload.pop("__path__", "unknown")
+                self._persistent_traces.setdefault(path, []).append(payload)
+            except Exception:
+                pass
+            return
+
         self._console_logs.append({
             "level": msg.type,
-            "text": msg.text,
+            "text": text,
             "timestamp": int(time.time() * 1000),
             "location": str(msg.location) if hasattr(msg, "location") else None,
         })
@@ -132,8 +169,9 @@ class BrowserManager:
         import fnmatch
         if not fnmatch.fnmatch(req.url, self._capture_pattern):
             return
+        self._request_id_counter += 1
         entry = {
-            "id": len(self._network_requests),
+            "id": self._request_id_counter,
             "url": req.url,
             "method": req.method,
             "resource_type": req.resource_type,
@@ -147,7 +185,8 @@ class BrowserManager:
         }
         self._network_requests.append(entry)
 
-    def _on_response(self, resp) -> None:
+    def _on_response_async(self, resp) -> None:
+        """Handle response events, optionally capturing body asynchronously."""
         if not self._capturing:
             return
         for entry in reversed(self._network_requests):
@@ -155,7 +194,26 @@ class BrowserManager:
                 entry["status"] = resp.status
                 entry["response_headers"] = dict(resp.headers)
                 entry["duration"] = int(time.time() * 1000) - entry["timestamp"]
+                if self._capture_body:
+                    asyncio.ensure_future(self._fetch_response_body(resp, entry))
                 break
+
+    async def _fetch_response_body(self, resp, entry: dict) -> None:
+        """Asynchronously fetch and store the response body."""
+        try:
+            body_bytes = await resp.body()
+            try:
+                body_text = body_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                body_text = body_bytes.decode("latin-1")
+            if len(body_text) > MAX_BODY_SIZE:
+                entry["response_body"] = body_text[:MAX_BODY_SIZE]
+                entry["response_body_truncated"] = True
+                entry["response_body_total_size"] = len(body_text)
+            else:
+                entry["response_body"] = body_text
+        except Exception:
+            entry["response_body"] = None
 
     async def create_context(self, name: str, cookies: list[dict] | None = None) -> dict:
         """Create a new isolated browser context with optional cookies."""
@@ -163,6 +221,8 @@ class BrowserManager:
         ctx = await self.browser.new_context()
         if cookies:
             await ctx.add_cookies(cookies)
+        for script_info in self._persistent_scripts:
+            await ctx.add_init_script(script=script_info["content"])
         self.contexts[name] = ctx
         page = await ctx.new_page()
         self._attach_listeners(page)
@@ -191,6 +251,10 @@ class BrowserManager:
         self._cm = None
         self._console_logs.clear()
         self._network_requests.clear()
+        self._request_id_counter = 0
         self._capturing = False
+        self._capture_body = False
         self._init_scripts.clear()
+        self._persistent_scripts.clear()
+        self._persistent_traces.clear()
         return {"status": "closed"}

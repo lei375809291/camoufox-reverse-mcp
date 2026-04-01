@@ -71,26 +71,34 @@ async def get_script_source(url: str) -> str:
 
 
 @mcp.tool()
-async def search_code(keyword: str, max_results: int = 20) -> list[dict]:
+async def search_code(keyword: str, max_results: int = 50) -> dict:
     """Search for a keyword across all loaded JavaScript sources in the page.
 
     Fetches each script's source and searches for the keyword, returning
     matching lines with 2 lines of surrounding context.
 
     Args:
-        keyword: The keyword or pattern to search for.
-        max_results: Maximum number of matches to return (default 20).
+        keyword: The keyword or pattern to search for (case-sensitive substring match).
+        max_results: Maximum number of matches to return (default 50, max 200).
 
     Returns:
-        List of dicts with script_url, line_number, context, and match fields.
+        dict with matches list, total_matches count, scripts_searched count,
+        and scripts_with_matches list. When results are truncated, total_matches
+        shows the real total so you know how many were omitted.
     """
     try:
+        if max_results > 200:
+            max_results = 200
+
         page = await browser_manager.get_active_page()
         results = await page.evaluate(f"""async () => {{
             const keyword = {repr(keyword)};
             const scripts = document.querySelectorAll('script');
-            const results = [];
+            const matches = [];
             const maxResults = {max_results};
+            let totalMatches = 0;
+            let scriptsSearched = 0;
+            const scriptsWithMatches = [];
 
             for (const s of scripts) {{
                 let source = '';
@@ -102,31 +110,135 @@ async def search_code(keyword: str, max_results: int = 20) -> list[dict]:
                         source = await resp.text();
                     }} catch(e) {{ continue; }}
                 }} else {{
-                    scriptUrl = 'inline';
+                    scriptUrl = 'inline:' + scriptsSearched;
                     source = s.textContent || '';
                 }}
+                scriptsSearched++;
 
                 const lines = source.split('\\n');
+                let scriptMatchCount = 0;
                 for (let i = 0; i < lines.length; i++) {{
-                    if (results.length >= maxResults) break;
                     if (lines[i].includes(keyword)) {{
-                        const start = Math.max(0, i - 2);
-                        const end = Math.min(lines.length, i + 3);
-                        results.push({{
-                            script_url: scriptUrl,
-                            line_number: i + 1,
-                            match: lines[i].trim().substring(0, 300),
-                            context: lines.slice(start, end).join('\\n').substring(0, 1000)
-                        }});
+                        totalMatches++;
+                        scriptMatchCount++;
+                        if (matches.length < maxResults) {{
+                            const start = Math.max(0, i - 2);
+                            const end = Math.min(lines.length, i + 3);
+                            const contextLines = lines.slice(start, end);
+                            const contextStr = contextLines.join('\\n');
+                            matches.push({{
+                                script_url: scriptUrl,
+                                line_number: i + 1,
+                                match: lines[i].trim().substring(0, 500),
+                                context: contextStr.length > 2000
+                                    ? contextStr.substring(0, 2000) + '...(truncated)'
+                                    : contextStr
+                            }});
+                        }}
                     }}
                 }}
-                if (results.length >= maxResults) break;
+                if (scriptMatchCount > 0) {{
+                    scriptsWithMatches.push({{
+                        url: scriptUrl,
+                        match_count: scriptMatchCount,
+                        source_length: source.length
+                    }});
+                }}
             }}
-            return results;
+            return {{
+                matches: matches,
+                total_matches: totalMatches,
+                returned_matches: matches.length,
+                scripts_searched: scriptsSearched,
+                scripts_with_matches: scriptsWithMatches,
+                truncated: totalMatches > matches.length
+            }};
         }}""")
         return results
     except Exception as e:
-        return [{"error": str(e)}]
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def search_code_in_script(
+    script_url: str,
+    keyword: str,
+    max_results: int = 100,
+) -> dict:
+    """Search for a keyword within a specific script file.
+
+    More targeted than search_code — avoids scanning all scripts and provides
+    more results from the target script.
+
+    Args:
+        script_url: URL of the script to search in. Use "inline:<index>" for
+            inline scripts.
+        keyword: The keyword to search for (case-sensitive substring match).
+        max_results: Maximum number of matches (default 100).
+
+    Returns:
+        dict with matches list, total_matches count, and script info.
+    """
+    try:
+        page = await browser_manager.get_active_page()
+        escaped_url = repr(script_url)
+        escaped_keyword = repr(keyword)
+
+        results = await page.evaluate(f"""async () => {{
+            const scriptUrl = {escaped_url};
+            const keyword = {escaped_keyword};
+            const maxResults = {max_results};
+            let source = '';
+
+            if (scriptUrl.startsWith('inline:')) {{
+                const idx = parseInt(scriptUrl.split(':')[1]);
+                const scripts = document.querySelectorAll('script');
+                source = scripts[idx] ? (scripts[idx].textContent || '') : '';
+                if (!source) return {{ error: 'Inline script not found at index ' + idx }};
+            }} else {{
+                try {{
+                    const resp = await fetch(scriptUrl);
+                    source = await resp.text();
+                }} catch(e) {{
+                    return {{ error: 'Failed to fetch script: ' + e.message }};
+                }}
+            }}
+
+            const lines = source.split('\\n');
+            const matches = [];
+            let totalMatches = 0;
+
+            for (let i = 0; i < lines.length; i++) {{
+                if (lines[i].includes(keyword)) {{
+                    totalMatches++;
+                    if (matches.length < maxResults) {{
+                        const start = Math.max(0, i - 3);
+                        const end = Math.min(lines.length, i + 4);
+                        const contextStr = lines.slice(start, end).join('\\n');
+                        matches.push({{
+                            line_number: i + 1,
+                            match: lines[i].trim().substring(0, 500),
+                            context: contextStr.length > 3000
+                                ? contextStr.substring(0, 3000) + '...(truncated)'
+                                : contextStr
+                        }});
+                    }}
+                }}
+            }}
+
+            return {{
+                script_url: scriptUrl,
+                source_length: source.length,
+                total_lines: lines.length,
+                matches: matches,
+                total_matches: totalMatches,
+                returned_matches: matches.length,
+                truncated: totalMatches > matches.length
+            }};
+        }}""")
+        return results
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()

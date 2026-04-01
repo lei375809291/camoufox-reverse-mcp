@@ -17,12 +17,29 @@ def test_default_config():
 
 def test_console_logs_maxlen():
     mgr = BrowserManager()
-    assert mgr._console_logs.maxlen == 500
+    assert mgr._console_logs.maxlen == 2000
 
 
 def test_network_requests_maxlen():
     mgr = BrowserManager()
-    assert mgr._network_requests.maxlen == 500
+    assert mgr._network_requests.maxlen == 2000
+
+
+def test_persistent_scripts_init():
+    mgr = BrowserManager()
+    assert isinstance(mgr._persistent_scripts, list)
+    assert len(mgr._persistent_scripts) == 0
+
+
+def test_persistent_traces_init():
+    mgr = BrowserManager()
+    assert isinstance(mgr._persistent_traces, dict)
+    assert len(mgr._persistent_traces) == 0
+
+
+def test_capture_body_default():
+    mgr = BrowserManager()
+    assert mgr._capture_body is False
 
 
 def test_init_scripts_list():
