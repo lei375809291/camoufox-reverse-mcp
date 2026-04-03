@@ -17,15 +17,22 @@ async def trace_function(
     persistent: bool = False,
 ) -> dict:
     """Trace all calls to a function without pausing execution.
-    Retrieve data with get_trace_data.
+
+    Records arguments, return values, and optionally call stacks for each invocation.
+    Data can be retrieved with get_trace_data.
 
     Args:
-        function_path: Full path e.g. "XMLHttpRequest.prototype.open".
-        log_args: Record arguments (default True).
+        function_path: Full path to the function, e.g. "XMLHttpRequest.prototype.open",
+            "window.encrypt", "JSON.stringify".
+        log_args: Record function arguments (default True).
         log_return: Record return values (default True).
-        log_stack: Record call stacks (default False).
-        max_captures: Max calls to record (default 50).
-        persistent: If True, survives navigation. Data collected Python-side.
+        log_stack: Record call stacks (default False, enable for call chain analysis).
+        max_captures: Maximum number of calls to record (default 50).
+        persistent: If True, the trace survives page navigation. Trace data is
+            collected Python-side via console events and won't be lost on reload.
+
+    Returns:
+        dict with status and the target function path.
     """
     try:
         if persistent:
@@ -120,10 +127,20 @@ async def hook_function(
     """Inject custom hook code on a target function.
 
     Args:
-        function_path: Full path e.g. "window.encrypt".
-        hook_code: JS code to execute. Context vars: arguments, __this, __result (after mode).
-        position: "before", "after", or "replace".
-        non_overridable: Use Object.defineProperty to prevent override.
+        function_path: Full path to the function, e.g. "window.encrypt".
+        hook_code: JavaScript code to execute. Available context variables:
+            - arguments: original function arguments
+            - __this: the 'this' context
+            - __result: original function's return value (only in "after" mode)
+        position: When to run hook_code relative to the original function:
+            - "before": Run hook_code before the original function.
+            - "after": Run hook_code after the original function (can access __result).
+            - "replace": Completely replace the original function with hook_code.
+        non_overridable: If True, use Object.defineProperty to prevent page scripts
+            from overwriting the hook. Default False.
+
+    Returns:
+        dict with status, target, and position.
     """
     try:
         page = await browser_manager.get_active_page()
@@ -200,12 +217,25 @@ async def hook_function(
 async def inject_hook_preset(preset: str, persistent: bool = True) -> dict:
     """Inject a pre-built hook template for common reverse engineering tasks.
 
-    Available presets: "xhr", "fetch", "crypto", "websocket", "debugger_bypass".
-    Hooks are protected with Object.defineProperty and persistent by default.
+    Hooks are injected with Object.defineProperty protection to prevent page
+    scripts from overriding them. By default, hooks are persistent across
+    navigations.
+
+    Available presets:
+        - "xhr": Hook XMLHttpRequest to log all XHR requests (URL, method, headers, body, stack).
+        - "fetch": Hook window.fetch to log all fetch requests.
+        - "crypto": Hook btoa/atob/JSON.stringify to capture encryption I/O.
+        - "websocket": Hook WebSocket to log all WS messages.
+        - "debugger_bypass": Bypass anti-debugging traps (infinite debugger loops,
+          Function constructor checks, setInterval checks).
 
     Args:
         preset: One of "xhr", "fetch", "crypto", "websocket", "debugger_bypass".
-        persistent: If True (default), survives page navigation.
+        persistent: If True (default), inject at context level so hooks survive
+            page navigation and reload automatically.
+
+    Returns:
+        dict with status and the preset name.
     """
     preset_map = {
         "xhr": "xhr_hook.js",
@@ -246,13 +276,23 @@ async def trace_property_access(
     persistent: bool = False,
     max_entries: int = 2000,
 ) -> dict:
-    """Track property access on specified objects to reveal environment info being read.
-    Use ".*" suffix for all properties (e.g. "navigator.*", "screen.*").
+    """Track property access on specified objects to reveal what environment info is being read.
+
+    Critical for JSVMP analysis: reveals which browser properties (navigator, screen,
+    canvas, etc.) the VM reads to generate fingerprints.
 
     Args:
-        targets: List of property paths to monitor.
+        targets: List of property paths to monitor. Use ".*" suffix for all properties
+            on an object. Examples:
+            - "navigator.*" — track all navigator property reads
+            - "screen.*" — track all screen property reads
+            - "document.cookie" — track cookie reads
+            - "canvas.getContext" — track specific method
         persistent: If True, tracking survives page navigation.
-        max_entries: Maximum access records (default 2000).
+        max_entries: Maximum number of access records (default 2000).
+
+    Returns:
+        dict with status and targets being tracked.
     """
     try:
         hooks_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks")

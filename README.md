@@ -349,9 +349,9 @@ AI 操作链：
 
 ## 更新记录
 
-### v0.3.0（2026-04-03）— 稳定性修复 + 响应体检索 + DOM 导出 + 会话管理 + Token 优化
+### v0.3.0（2026-04-03）— 稳定性修复 + 响应体检索 + DOM 导出 + 会话管理
 
-> 修复实战中的稳定性问题，补全响应体检索、渲染态 DOM 导出、会话管理等缺失能力，优化 token 消耗。工具总数从 52 个增长至 57 个。
+> 修复实战中的稳定性问题，补全响应体检索、渲染态 DOM 导出、会话管理等缺失能力。工具总数从 52 个增长至 57 个。
 
 **新增工具（5 个）**
 | 工具 | 说明 |
@@ -370,7 +370,7 @@ AI 操作链：
 - **launch_browser**：已启动时返回完整会话状态（页面 URL、上下文列表、抓包状态），不再只返回 `already_running`
 - **get_network_request**：新增 `include_headers=False` 选项，省略 headers 节约 token
 - **list_network_requests**：URL 截断到 200 字符，响应字段名缩短（`resource_type` → `type`，`duration` → `ms`）
-- **docstring 精简**：所有工具描述精简约 40%，减少每次 MCP 调用的 token 开销
+- **工具描述优化**：梳理所有工具的描述文案，使参数说明和使用场景更清晰明了
 - **大响应体可观测性**：`search_response_body` 支持按关键词搜索全部已捕获响应 body；`get_response_body_page` 支持分页读取；`search_json_path` 支持按路径直接提取 JSON 数据
 
 ### v0.2.0（2026-04-01）— Hook 持久化 + JSVMP 专项分析

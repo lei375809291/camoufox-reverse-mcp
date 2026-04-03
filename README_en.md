@@ -307,9 +307,9 @@ AI workflow:
 
 ## Changelog
 
-### v0.3.0 (2026-04-03) — Stability Fixes + Response Search + DOM Export + Session Management + Token Optimization
+### v0.3.0 (2026-04-03) — Stability Fixes + Response Search + DOM Export + Session Management
 
-> Fix real-world stability issues, add response body search, rendered DOM export, session management, and reduce token consumption. Tools: 52 → 57.
+> Fix real-world stability issues, add response body search, rendered DOM export, and session management. Tools: 52 → 57.
 
 **New Tools (5)**
 | Tool | Description |
@@ -328,7 +328,7 @@ AI workflow:
 - **launch_browser**: Returns full session state when already running (page URLs, contexts, capture status)
 - **get_network_request**: New `include_headers=False` option to save tokens
 - **list_network_requests**: Shorter field names, URL truncated to 200 chars
-- **Docstrings trimmed ~40%** to reduce per-call MCP token overhead
+- **Tool descriptions refined**: Clearer parameter docs and usage guidance for all tools
 
 ### v0.2.0 (2026-04-01) — Hook Persistence + JSVMP Analysis
 

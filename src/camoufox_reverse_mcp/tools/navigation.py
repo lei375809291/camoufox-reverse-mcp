@@ -19,14 +19,23 @@ async def launch_browser(
     """Launch the Camoufox anti-detection browser.
 
     Args:
-        headless: Headless mode (default False).
-        os_type: OS fingerprint: "auto", "windows", "macos", "linux".
-        locale: Browser locale ("auto" detects system).
-        proxy: Proxy URL (e.g. "http://127.0.0.1:7890").
-        humanize: Enable humanized mouse movement.
+        headless: Run in headless mode (default False for debugging visibility).
+        os_type: OS fingerprint to emulate - "auto" (detect host OS),
+            "windows", "macos", or "linux". Using "auto" ensures CJK fonts
+            render correctly on the host system.
+        locale: Browser locale such as "zh-CN", "en-US". Defaults to "auto"
+            which detects the system locale. Affects Accept-Language headers
+            and content language preferences.
+        proxy: Proxy server URL (e.g. "http://127.0.0.1:7890").
+        humanize: Enable humanized mouse movement to mimic real users.
         geoip: Auto-infer geolocation from proxy IP.
-        block_images: Block image loading.
-        block_webrtc: Block WebRTC.
+        block_images: Block image loading for faster page loads.
+        block_webrtc: Block WebRTC to prevent IP leaks.
+
+    Returns:
+        dict with status, headless flag, os type, locale, and page list.
+        If browser is already running, returns full session state including
+        active page, page URLs, context list, and capture status.
     """
     try:
         config = {
