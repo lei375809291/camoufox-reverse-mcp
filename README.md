@@ -238,48 +238,6 @@ python -m camoufox_reverse_mcp \
 
 ---
 
-## v0.2.0 主要改进
-
-### 1. Hook 持久化 & 防覆盖
-
-- `inject_hook_preset` 默认使用 context 级 `add_init_script`，**导航后自动重注入**
-- XHR/Fetch Hook 使用 `Object.defineProperty(configurable: false)` 防止页面脚本覆盖
-- Hook 函数的 `toString()` 返回 `[native code]`，避免被反检测发现
-- 新增 `freeze_prototype` 工具，可冻结任意原型方法
-
-### 2. get_request_initiator 修复
-
-- 改进 URL 匹配算法（pathname 级别匹配）
-- 添加诊断信息：显示 Hook 是否激活、日志条目数量
-- 提供具体的错误排查建议
-
-### 3. trace_function 持久化
-
-- 新增 `persistent=True` 参数，跨导航自动重注入
-- 持久化模式通过 console 事件收集数据到 Python 端，导航不丢失
-- `get_trace_data` 自动合并页面数据和持久化数据
-
-### 4. JSVMP 专项分析工具
-
-- `hook_jsvmp_interpreter`：自动插桩 Function.prototype.apply 和敏感属性，追踪 JSVMP 的全部外部交互
-- `dump_jsvmp_strings`：提取字符串数组、解码混淆字符串、识别 API 名称
-- `trace_property_access`：Proxy 级别属性访问追踪，揭示指纹收集行为
-- `compare_env`：全面收集浏览器环境指纹，用于 Node.js/jsdom 环境对比
-
-### 5. search_code 改进
-
-- 不再静默截断：返回 `total_matches` 总数和 `scripts_with_matches` 列表
-- 默认 `max_results` 提升到 50（最大 200）
-- 新增 `search_code_in_script` 支持在指定脚本中搜索（更多上下文，更高限额）
-
-### 6. 网络捕获增强
-
-- `start_network_capture(capture_body=True)` 支持捕获响应体
-- 大响应体自动截断并标记 `response_body_truncated`
-- 请求 ID 使用全局递增计数器，不再重复
-
----
-
 ## 使用场景示例
 
 ### 场景 1：逆向登录接口的签名参数
@@ -311,14 +269,14 @@ AI 操作链：
 2. bypass_debugger_trap()                ← 先绕过反调试
 3. inject_hook_preset("xhr")             ← 持久化 Hook
 4. inject_hook_preset("fetch")           ← 持久化 Hook
-5. hook_jsvmp_interpreter("webmssdk.es5.js")  ← [新] JSVMP 插桩
-6. trace_property_access(["navigator.*", "screen.*", "document.cookie"])  ← [新]
+5. hook_jsvmp_interpreter("webmssdk.es5.js")  ← JSVMP 插桩
+6. trace_property_access(["navigator.*", "screen.*", "document.cookie"])
 7. navigate("https://target.com")
 8. 触发目标操作（翻页、搜索等）
-9. get_jsvmp_log()                       ← [新] 查看 JSVMP 访问了哪些 API
-10. get_property_access_log()            ← [新] 查看读取了哪些环境属性
-11. dump_jsvmp_strings("webmssdk.es5.js") ← [新] 提取字符串表
-12. compare_env()                        ← [新] 收集浏览器环境，与 Node.js 对比
+9. get_jsvmp_log()                       ← 查看 JSVMP 访问了哪些 API
+10. get_property_access_log()            ← 查看读取了哪些环境属性
+11. dump_jsvmp_strings("webmssdk.es5.js") ← 提取字符串表
+12. compare_env()                        ← 收集浏览器环境，与 Node.js 对比
 13. 根据 API 调用和属性访问记录还原算法逻辑
 ```
 
@@ -346,6 +304,21 @@ AI 操作链：
 7. navigate("https://page2.com")                 ← Hook 自动重注入！
 8. get_trace_data()                              ← 数据包含两个页面的记录
 9. freeze_prototype("XMLHttpRequest", "open")    ← 防止页面覆盖
+```
+
+### 场景 5：大响应体数据定位 + 渲染态 DOM 导出
+
+```
+AI 操作链：
+1. launch_browser()
+2. start_network_capture(capture_body=True)       ← 开启响应体捕获
+3. navigate("https://example.com/data")
+4. get_session_info()                             ← 确认当前会话状态和抓包情况
+5. list_network_requests(resource_type="xhr")     ← 找到目标接口
+6. search_response_body("token")                  ← 在所有响应体中搜索关键词
+7. search_json_path(request_id=5, json_path="data.list[*].sign")  ← 精准提取 JSON 数据
+8. get_response_body_page(request_id=5, offset=0, length=10000)   ← 分页查看大 body
+9. get_page_content()                             ← 一键导出渲染后 HTML + 可见文本
 ```
 
 ---
