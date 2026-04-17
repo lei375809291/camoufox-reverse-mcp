@@ -272,4 +272,4 @@ async def test_pre_inject_js_exception_does_not_fail_registration():
 
 def test_version_is_040():
     from camoufox_reverse_mcp import __version__
-    assert __version__ == "0.4.0"
+    assert __version__ == "0.4.2"
