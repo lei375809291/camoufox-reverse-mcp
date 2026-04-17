@@ -385,6 +385,8 @@ AI 操作链：
 13. # 根据插桩数据在 Node.js / jsdom 侧补齐环境差异，跑通算法
 ```
 
+> 👉 完整的反爬类型识别与工作流见 [docs/JSVMP_PLAYBOOK.md](docs/JSVMP_PLAYBOOK.md)
+
 ---
 
 ## 技术架构

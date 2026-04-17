@@ -351,6 +351,8 @@ AI workflow:
 13. Reconstruct algorithm from instrumentation data
 ```
 
+> 👉 Full anti-bot type identification and workflow guide: [docs/JSVMP_PLAYBOOK.md](docs/JSVMP_PLAYBOOK.md)
+
 ---
 
 ## Changelog
