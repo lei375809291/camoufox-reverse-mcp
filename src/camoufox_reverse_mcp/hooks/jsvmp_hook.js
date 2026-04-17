@@ -212,65 +212,87 @@
 
     // ========== 3. Proxy 式属性读取追踪 ==========
     if (CFG.trackProps) {
-        function wrapObjectWithProxy(parent, propName) {
-            var orig = parent[propName];
+        var wrapObjectWithProxy = function (parent, propName) {
+            var orig;
+            try { orig = parent[propName]; } catch (e) { return false; }
             if (!orig || (typeof orig !== 'object' && typeof orig !== 'function')) return false;
 
+            // v0.6.0: backup original object for uninstall
+            window.__mcp_proxy_originals = window.__mcp_proxy_originals || {};
+            if (!(propName in window.__mcp_proxy_originals)) {
+                window.__mcp_proxy_originals[propName] = orig;
+            }
+
+            // v0.6.0: per-proxy reentrance guard
+            var _inGetTrap = false;
+            var _inSetTrap = false;
+
             var proxy = new Proxy(orig, {
-                get: function(target, key, receiver) {
+                get: function (target, key, receiver) {
+                    if (_inGetTrap) {
+                        try { return target[key]; } catch (e) { return undefined; }
+                    }
+                    _inGetTrap = true;
                     var val;
                     try {
-                        val = _Reflect_get(target, key, receiver);
-                    } catch (e) {
-                        val = target[key];
-                    }
-                    try {
-                        if (typeof key === 'string' && !key.startsWith('__mcp_')) {
-                            var stack = shortStack();
-                            if (inTargetScript(stack)) {
-                                log({
-                                    type: 'proxy_get',
-                                    obj: propName,
-                                    key: key,
-                                    value: preview(val, 150),
-                                    stack: stack
-                                });
-                            }
+                        try {
+                            val = _Reflect_get(target, key, receiver);
+                        } catch (e) {
+                            try { val = target[key]; } catch (e2) { val = undefined; }
                         }
-                    } catch (e) {}
-                    // 方法调用保持 this 正确:如果是函数,绑定到原对象
+                        try {
+                            if (typeof key === 'string' && key.indexOf('__mcp_') !== 0) {
+                                var stack = shortStack();
+                                if (inTargetScript(stack)) {
+                                    log({
+                                        type: 'proxy_get',
+                                        obj: propName,
+                                        key: key,
+                                        value: preview(val, 150),
+                                        stack: stack
+                                    });
+                                }
+                            }
+                        } catch (e) {}
+                    } finally {
+                        _inGetTrap = false;
+                    }
                     if (typeof val === 'function') {
-                        return val.bind(target);
+                        try { return val.bind(target); } catch (e) { return val; }
                     }
                     return val;
                 },
-                set: function(target, key, value, receiver) {
+                set: function (target, key, value, receiver) {
+                    if (_inSetTrap) {
+                        try { return Reflect.set(target, key, value, receiver); }
+                        catch (e) { try { target[key] = value; } catch (e2) {} return true; }
+                    }
+                    _inSetTrap = true;
                     try {
-                        if (typeof key === 'string' && !key.startsWith('__mcp_')) {
-                            var stack = shortStack();
-                            if (inTargetScript(stack)) {
-                                log({
-                                    type: 'proxy_set',
-                                    obj: propName,
-                                    key: key,
-                                    value: preview(value, 150),
-                                    stack: stack
-                                });
+                        try {
+                            if (typeof key === 'string' && key.indexOf('__mcp_') !== 0) {
+                                var stack = shortStack();
+                                if (inTargetScript(stack)) {
+                                    log({
+                                        type: 'proxy_set',
+                                        obj: propName,
+                                        key: key,
+                                        value: preview(value, 150),
+                                        stack: stack
+                                    });
+                                }
                             }
-                        }
-                    } catch (e) {}
-                    return _Reflect_set(target, key, value, receiver);
+                        } catch (e) {}
+                        return _Reflect_set(target, key, value, receiver);
+                    } finally {
+                        _inSetTrap = false;
+                    }
                 },
-                has: function(target, key) {
+                has: function (target, key) {
                     try {
                         var stack = shortStack();
                         if (inTargetScript(stack)) {
-                            log({
-                                type: 'proxy_has',
-                                obj: propName,
-                                key: String(key),
-                                stack: stack
-                            });
+                            log({ type: 'proxy_has', obj: propName, key: String(key), stack: stack });
                         }
                     } catch (e) {}
                     return key in target;
@@ -279,16 +301,13 @@
 
             try {
                 _Object_defineProperty(parent, propName, {
-                    value: proxy,
-                    writable: true,
-                    configurable: true,
-                    enumerable: true
+                    value: proxy, writable: true, configurable: true, enumerable: true
                 });
                 return true;
             } catch (e) {
                 try { parent[propName] = proxy; return true; } catch (e2) { return false; }
             }
-        }
+        };
 
         for (var i = 0; i < CFG.proxyObjects.length; i++) {
             try {
@@ -333,6 +352,27 @@
             } catch (e) {}
         }
     }
+
+    // v0.6.0: uninstall function for remove_hooks to restore original objects
+    window.__mcp_jsvmp_uninstall = function() {
+        var restored = [];
+        var originals = window.__mcp_proxy_originals || {};
+        for (var name in originals) {
+            try {
+                _Object_defineProperty(window, name, {
+                    value: originals[name],
+                    writable: true, configurable: true, enumerable: true
+                });
+                restored.push(name);
+            } catch (e) {
+                try { window[name] = originals[name]; restored.push(name + '(fallback)'); }
+                catch (e2) {}
+            }
+        }
+        window.__mcp_jsvmp_installed = false;
+        window.__mcp_proxy_originals = {};
+        return { restored: restored };
+    };
 
     console.log('[JSVMP] Probe installed. scriptUrl=' + (CFG.scriptUrl || '(all)') +
                 ' calls=' + CFG.trackCalls + ' props=' + CFG.trackProps +

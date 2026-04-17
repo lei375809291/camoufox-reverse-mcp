@@ -120,6 +120,10 @@
                 });
             } catch (e) {}
 
+            // v0.6.0: save original descriptor for uninstall
+            window.__mcp_transparent_originals = window.__mcp_transparent_originals || [];
+            window.__mcp_transparent_originals.push({ owner: owner, prop: prop, desc: desc });
+
             _Object_defineProperty(owner, prop, {
                 get: fakeGet,
                 set: desc.set,
@@ -162,6 +166,21 @@
             if (tapGetter(ownerName, owner, p)) tapStats.tapped++;
         }
     }
+
+    // v0.6.0: uninstall function
+    window.__mcp_transparent_uninstall = function() {
+        var restored = [];
+        var origs = window.__mcp_transparent_originals || [];
+        for (var i = 0; i < origs.length; i++) {
+            try {
+                _Object_defineProperty(origs[i].owner, origs[i].prop, origs[i].desc);
+                restored.push(origs[i].prop);
+            } catch (e) {}
+        }
+        window.__mcp_jsvmp_transparent_installed = false;
+        window.__mcp_transparent_originals = [];
+        return { restored: restored };
+    };
 
     try {
         console.log('[JSVMP-T] Transparent probe installed. Tapped ' +
