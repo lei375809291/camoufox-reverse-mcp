@@ -195,7 +195,7 @@ python -m camoufox_reverse_mcp \
 | `trace_function` | 追踪函数调用（**支持 persistent 持久化，跨导航数据不丢失**） |
 | `get_trace_data` | 获取追踪数据（**合并页面内数据和持久化数据**） |
 | `hook_function` | 注入自定义 Hook（before/after/replace，**支持 non_overridable 防覆盖**） |
-| `inject_hook_preset` | 一键注入预置 Hook（**默认 persistent=True 持久化**） |
+| `inject_hook_preset` | 一键注入预置 Hook（xhr/fetch/crypto/websocket/debugger_bypass/cookie/runtime_probe，**默认 persistent=True 持久化**） |
 | `trace_property_access` | **[新]** 追踪属性访问（Proxy 级别），揭示 JSVMP 读取的环境信息 |
 | `get_property_access_log` | **[新]** 获取属性访问记录 |
 | `remove_hooks` | 移除所有 Hook（**可选保留持久化 Hook**） |

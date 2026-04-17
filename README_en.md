@@ -186,7 +186,7 @@ python -m camoufox_reverse_mcp \
 - `trace_function` — Trace function calls without pausing (**persistent**, cross-navigation)
 - `get_trace_data` — Get collected trace data (merges page + persistent data)
 - `hook_function` — Inject custom hook code (before/after/replace, **non_overridable**)
-- `inject_hook_preset` — One-click preset hooks (xhr/fetch/crypto/websocket/debugger_bypass, **persistent by default**)
+- `inject_hook_preset` — One-click preset hooks (xhr/fetch/crypto/websocket/debugger_bypass/cookie/runtime_probe, **persistent by default**)
 - `trace_property_access` — Track property access (Proxy-level), reveals JSVMP env reads
 - `get_property_access_log` — Get property access records
 - `remove_hooks` — Remove all hooks (optionally keep persistent ones)
