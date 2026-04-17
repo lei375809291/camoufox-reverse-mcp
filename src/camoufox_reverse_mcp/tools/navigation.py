@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json as _json
 import os
 
 from ..server import mcp, browser_manager
+
+# Timeout for pre-inject operations on about:blank. Some hooks (jsvmp Proxy
+# install, cookie descriptor walk) can wedge on opaque-origin blank pages;
+# the persistent add_init_script path is what actually matters for the next
+# real navigation, so evaluate here is strictly best-effort.
+_PRE_INJECT_REGISTER_TIMEOUT = 5.0
+_PRE_INJECT_EVAL_TIMEOUT = 3.0
 
 
 @mcp.tool()
@@ -138,6 +146,8 @@ async def navigate(
                     ok, msg = await _inject_hook_by_name(name)
                     if ok:
                         hooks_injected.append(name)
+                        if msg != "ok":
+                            warnings.append(f"pre-inject '{name}': {msg}")
                     else:
                         warnings.append(f"pre-inject '{name}' failed: {msg}")
 
@@ -170,7 +180,17 @@ async def navigate(
 
 
 async def _inject_hook_by_name(name: str) -> tuple[bool, str]:
-    """Dispatch pre-inject hooks by symbolic name. Returns (ok, msg)."""
+    """Dispatch pre-inject hooks by symbolic name. Returns (ok, msg).
+
+    Two-step flow:
+      1. Register the script at context level (add_init_script). This is the
+         load-bearing step — it guarantees the hook runs on the NEXT real
+         page.goto(url) before any target-site JS executes.
+      2. Best-effort evaluate on the current about:blank page so the hook is
+         also live there. Wrapped in JS try/catch AND an asyncio timeout:
+         some hooks (jsvmp Proxy install, cookie descriptor walk) can wedge
+         on opaque blank pages, and we must not let that block navigation.
+    """
     hooks_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks")
 
     preset_files = {
@@ -183,11 +203,9 @@ async def _inject_hook_by_name(name: str) -> tuple[bool, str]:
         "runtime_probe": "runtime_probe.js",
     }
 
+    # Step A: build the JS
     try:
-        page = await browser_manager.get_active_page()
-
         if name == "jsvmp_probe":
-            # Use default jsvmp probe with empty script_url (all scripts)
             with open(os.path.join(hooks_dir, "jsvmp_hook.js"), "r", encoding="utf-8") as f:
                 tpl = f.read()
             default_proxy = ["navigator", "screen", "history", "localStorage",
@@ -200,23 +218,51 @@ async def _inject_hook_by_name(name: str) -> tuple[bool, str]:
                 .replace("{{TRACK_REFLECT}}", "true")
                 .replace("'{{PROXY_OBJECTS}}'", _json.dumps(_json.dumps(default_proxy)))
             )
-            await browser_manager.add_persistent_script("pre_inject:jsvmp_probe", js)
-            await page.evaluate(js)
-            return True, "ok"
-
-        if name in preset_files:
+            persist_name = "pre_inject:jsvmp_probe"
+        elif name in preset_files:
             fpath = os.path.join(hooks_dir, preset_files[name])
             if not os.path.exists(fpath):
                 return False, f"hook file not found: {preset_files[name]}"
             with open(fpath, "r", encoding="utf-8") as f:
                 js = f.read()
-            await browser_manager.add_persistent_script(f"pre_inject:{name}", js)
-            await page.evaluate(js)
-            return True, "ok"
-
-        return False, f"unknown hook name: {name}"
+            persist_name = f"pre_inject:{name}"
+        else:
+            return False, f"unknown hook name: {name}"
     except Exception as e:
-        return False, str(e)
+        return False, f"prepare failed: {e}"
+
+    # Step B: register at context level (must succeed)
+    try:
+        await asyncio.wait_for(
+            browser_manager.add_persistent_script(persist_name, js),
+            timeout=_PRE_INJECT_REGISTER_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return False, "add_persistent_script timed out"
+    except Exception as e:
+        return False, f"add_persistent_script failed: {e}"
+
+    # Step C: best-effort evaluate on current (about:blank) page. Wrap in
+    # JS try/catch so a failing hook body does not leave the page in a
+    # half-installed state, and wrap in asyncio.wait_for so a wedged
+    # evaluate cannot block the whole navigate call.
+    try:
+        page = await browser_manager.get_active_page()
+    except Exception as e:
+        return True, f"registered (no active page for eval: {e})"
+
+    wrapped = (
+        "(function(){try{" + js + "}catch(e){"
+        "try{console.warn('[pre_inject:" + name + "] '+e.message);}catch(_){}}"
+        "})()"
+    )
+    try:
+        await asyncio.wait_for(page.evaluate(wrapped), timeout=_PRE_INJECT_EVAL_TIMEOUT)
+        return True, "ok"
+    except asyncio.TimeoutError:
+        return True, "registered (blank-page eval timed out; will fire on goto)"
+    except Exception as e:
+        return True, f"registered (blank-page eval error: {e})"
 
 
 @mcp.tool()

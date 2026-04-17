@@ -398,6 +398,19 @@ AI workflow:
 
 > Camoufox anti-detection browser MCP server, 44 tools covering the full JS reverse engineering workflow.
 
+## Feedback / Contact
+
+Hit a bug, want a new hook preset, or just want to chat about JS reverse
+engineering? Add me on WeChat:
+
+- **WeChat ID**: `han8888v8888`
+
+<p align="left">
+  <img src="assets/wechat_qr.png" alt="WeChat QR" width="220" />
+</p>
+
+> Please note "camoufox-reverse" in your friend request so I can approve it quickly.
+
 ## License
 
 MIT

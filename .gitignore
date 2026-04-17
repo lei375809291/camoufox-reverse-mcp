@@ -13,3 +13,8 @@ build/
 .venv/
 venv/
 env/
+
+# IDE / AI tool caches
+.claude/
+.kiro/
+.cursor/
