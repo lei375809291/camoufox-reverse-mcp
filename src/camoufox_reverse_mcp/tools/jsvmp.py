@@ -169,126 +169,172 @@ async def get_jsvmp_log(
 
 @mcp.tool()
 async def dump_jsvmp_strings(script_url: str) -> dict:
-    """Extract and decode strings from a JSVMP-protected script.
+    """Extract and categorize strings from a JSVMP-protected script.
 
-    Parses the script to find string arrays (common in JSVMP/OB obfuscation),
-    attempts to decode XOR-encrypted or shifted string tables, and returns
-    all readable strings. This reveals which API names, property names, and
-    constants the JSVMP interpreter uses internally.
+    Finds large string arrays (common in JSVMP/obfuscator), collects all
+    string literals, and flags suspicious VMP patterns (XOR decryption,
+    while+switch dispatch loops, eval/Function constructors).
 
     Args:
         script_url: URL of the JSVMP-protected script.
 
     Returns:
-        dict with decoded_strings, string_arrays found, and analysis info.
+        dict with string_arrays, decoded_strings, api_names, and
+        suspicious_patterns.
     """
     try:
         page = await browser_manager.get_active_page()
 
-        results = await page.evaluate(f"""async () => {{
-            const url = {json.dumps(script_url)};
+        # Write the entire extractor as a standalone function to avoid
+        # f-string + regex double-escaping issues
+        extractor = r"""
+        async (url) => {
             let source;
-            try {{
+            try {
                 const resp = await fetch(url);
                 source = await resp.text();
-            }} catch(e) {{
-                return {{ error: 'Failed to fetch script: ' + e.message }};
-            }}
+            } catch (e) {
+                return { error: 'Failed to fetch script: ' + e.message };
+            }
 
-            const results = {{
+            const results = {
                 script_url: url,
                 source_length: source.length,
                 string_arrays: [],
                 decoded_strings: [],
                 api_names: [],
                 suspicious_patterns: []
-            }};
+            };
 
-            // Pattern 1: Large array literals with strings
-            const arrayPattern = new RegExp('(?:var|let|const)\\\\s+(\\\\w+)\\\\s*=\\\\s*\\\\[((?:[^\\\\[\\\\]]*(?:\\\\[(?:[^\\\\[\\\\]]*\\\\])*[^\\\\[\\\\]]*)*?))\\\\]', 'g');
-            let match;
-            while ((match = arrayPattern.exec(source)) !== null) {{
-                const content = match[2];
-                const strings = [];
-                const strPattern = new RegExp('["\\']((?:[^"\\'\\\\\\\\]|\\\\\\\\.){{2,}})["\\']+', 'g');
-                let strMatch;
-                while ((strMatch = strPattern.exec(content)) !== null) {{
-                    strings.push(strMatch[1]);
-                }}
-                if (strings.length >= 10) {{
-                    results.string_arrays.push({{
-                        variable: match[1],
-                        count: strings.length,
-                        position: match.index,
-                        preview: strings.slice(0, 30)
-                    }});
-                    results.decoded_strings.push(...strings);
-                }}
-            }}
+            // Pattern 1: var/let/const X = [...]
+            // We scan manually with bracket matching to avoid regex depth issues
+            function findArrayLiterals(src) {
+                const arrs = [];
+                const re = /(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*\[/g;
+                let m;
+                while ((m = re.exec(src)) !== null) {
+                    const nameEnd = m.index + m[0].length - 1;
+                    let depth = 1, i = nameEnd + 1;
+                    while (i < src.length && depth > 0) {
+                        const c = src[i];
+                        if (c === '"' || c === "'" || c === '`') {
+                            const q = c;
+                            i++;
+                            while (i < src.length && src[i] !== q) {
+                                if (src[i] === '\\') i += 2;
+                                else i++;
+                            }
+                            i++;
+                        } else if (c === '[') { depth++; i++; }
+                        else if (c === ']') { depth--; i++; }
+                        else i++;
+                    }
+                    if (depth === 0) {
+                        arrs.push({ name: m[1], start: nameEnd, end: i,
+                                    body: src.slice(nameEnd + 1, i - 1) });
+                    }
+                }
+                return arrs;
+            }
 
-            // Pattern 2: String literals throughout the code
+            function extractQuotedStrings(body) {
+                const strs = [];
+                let i = 0;
+                while (i < body.length) {
+                    const c = body[i];
+                    if (c === '"' || c === "'") {
+                        const q = c;
+                        let s = '';
+                        i++;
+                        while (i < body.length && body[i] !== q) {
+                            if (body[i] === '\\' && i + 1 < body.length) {
+                                s += body[i] + body[i + 1];
+                                i += 2;
+                            } else {
+                                s += body[i];
+                                i++;
+                            }
+                        }
+                        i++;
+                        strs.push(s);
+                    } else {
+                        i++;
+                    }
+                }
+                return strs;
+            }
+
+            const arrays = findArrayLiterals(source);
+            for (const arr of arrays) {
+                const strs = extractQuotedStrings(arr.body);
+                if (strs.length >= 10) {
+                    results.string_arrays.push({
+                        variable: arr.name,
+                        count: strs.length,
+                        position: arr.start,
+                        preview: strs.slice(0, 30)
+                    });
+                    results.decoded_strings.push(...strs);
+                }
+            }
+
+            // Collect ALL string literals (bounded) for api-name detection
             const allStrings = new Set();
-            const literalPattern = new RegExp('["\\']((?:[^"\\'\\\\\\\\]|\\\\\\\\.){{3,100}})["\\']+', 'g');
-            while ((match = literalPattern.exec(source)) !== null) {{
-                const s = match[1];
-                try {{
-                    const decoded = JSON.parse('"' + s + '"');
-                    allStrings.add(decoded);
-                }} catch(e) {{
-                    allStrings.add(s);
-                }}
-            }}
+            const allLits = extractQuotedStrings(source);
+            for (const s of allLits) {
+                if (s.length >= 3 && s.length <= 100) {
+                    try {
+                        const d = JSON.parse('"' + s.replace(/"/g, '\\"') + '"');
+                        allStrings.add(d);
+                    } catch (e) { allStrings.add(s); }
+                }
+            }
 
-            // Filter for API-like names
-            const browserAPIs = ['navigator', 'screen', 'document', 'window', 'canvas',
-                'getContext', 'toDataURL', 'getImageData', 'createElement', 'querySelector',
-                'userAgent', 'platform', 'language', 'plugins', 'mimeTypes', 'webdriver',
-                'hardwareConcurrency', 'deviceMemory', 'vendor', 'appVersion',
-                'width', 'height', 'colorDepth', 'pixelDepth', 'availWidth', 'availHeight',
-                'cookie', 'referrer', 'domain', 'title', 'hidden', 'visibilityState',
-                'WebGL', 'getExtension', 'getParameter', 'getSupportedExtensions',
-                'AudioContext', 'createOscillator', 'createAnalyser',
-                'performance', 'timing', 'now',
-                'crypto', 'subtle', 'digest', 'getRandomValues',
-                'fetch', 'XMLHttpRequest', 'open', 'send', 'setRequestHeader',
-                'localStorage', 'sessionStorage', 'indexedDB',
-                'a_bogus', 'X-Bogus', 'msToken', '_signature', 'sign', 'token',
+            const apiKeywords = [
+                'navigator', 'screen', 'document', 'window', 'location',
+                'userAgent', 'platform', 'language', 'cookie', 'webdriver',
                 'encrypt', 'decrypt', 'hash', 'md5', 'sha256', 'hmac', 'aes', 'base64',
-                'fromCharCode', 'charCodeAt', 'btoa', 'atob', 'encodeURIComponent',
-                'toString', 'valueOf', 'constructor', 'prototype',
+                'fromCharCode', 'charCodeAt', 'btoa', 'atob',
+                'encodeURIComponent', 'toString', 'valueOf',
                 'apply', 'call', 'bind',
-                'getTimezoneOffset', 'toISOString', 'toLocaleString'
+                'getTimezoneOffset', 'toISOString', 'toLocaleString',
+                'addEventListener', 'dispatchEvent'
             ];
-
-            for (const s of allStrings) {{
-                if (browserAPIs.some(api => s.includes(api))) {{
+            for (const s of allStrings) {
+                if (apiKeywords.some(api => s.includes(api))) {
                     results.api_names.push(s);
-                }}
-            }}
+                }
+            }
 
-            // Pattern 3: Look for JSVMP-specific patterns
-            if (source.includes('while') && source.includes('switch') && source.length > 100000) {{
-                results.suspicious_patterns.push('JSVMP interpreter loop (while+switch)');
-            }}
-            if (source.includes('eval(') || source.includes('eval (')) {{
-                results.suspicious_patterns.push('eval usage detected');
-            }}
-            if (source.includes('Function(') || source.includes('Function (')) {{
+            // Suspicious patterns
+            if (source.length > 100000 &&
+                /while\s*\(\s*(?:!\s*!\s*\[\s*\]|true|1)\s*\)/.test(source) &&
+                /switch\s*\(/.test(source)) {
+                results.suspicious_patterns.push('JSVMP interpreter loop (while+switch, large source)');
+            }
+            if (/eval\s*\(/.test(source)) {
+                results.suspicious_patterns.push('eval() usage detected');
+            }
+            if (/\bnew\s+Function\s*\(/.test(source) || /\bFunction\s*\(\s*['"]/.test(source)) {
                 results.suspicious_patterns.push('Dynamic Function constructor');
-            }}
-            const xorPattern = new RegExp('\\\\^\\\\s*0x[0-9a-f]+', 'gi');
-            const xorMatches = source.match(xorPattern);
-            if (xorMatches && xorMatches.length > 5) {{
-                results.suspicious_patterns.push('XOR string decryption (' + xorMatches.length + ' XOR operations)');
-            }}
+            }
+            const xorMatches = source.match(/\^\s*0x[0-9a-fA-F]+/g);
+            if (xorMatches && xorMatches.length > 5) {
+                results.suspicious_patterns.push('XOR decryption (' + xorMatches.length + ' ops)');
+            }
+            if (/atob\s*\(/.test(source) && /fromCharCode/.test(source)) {
+                results.suspicious_patterns.push('Base64 + fromCharCode decoder');
+            }
 
             results.api_names = [...new Set(results.api_names)].sort();
             results.decoded_strings = [...new Set(results.decoded_strings)].slice(0, 500);
             results.total_unique_strings = allStrings.size;
 
             return results;
-        }}""")
-        return results
+        }
+        """
+
+        return await page.evaluate(extractor, script_url)
     except Exception as e:
         return {"error": str(e)}
 
