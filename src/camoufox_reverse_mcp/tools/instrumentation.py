@@ -37,7 +37,15 @@ async def instrument_jsvmp_source(
 ) -> dict:
     """Intercept a JSVMP script and instrument its source at the HTTP layer.
 
-    This is the most powerful technique for analyzing JSVMP-protected scripts.
+    ★ RECOMMENDED DEFAULT for signature-based anti-bot (Rui Shu, Akamai,
+    Shape Security). Unlike runtime hooks, this tool rewrites the JS source
+    before the browser executes it. The environment stays pristine — the
+    VMP reads the real navigator, computes the real signature, and the
+    server accepts it. Meanwhile every internal operation of the VMP is
+    logged through the injected taps.
+
+    This is the only observation technique compatible with cookie/signature
+    schemes that hash environment properties.
     Unlike runtime hooks that only see what the VMP routes through hookable
     APIs, source-level instrumentation inserts taps at EVERY member access
     and function call - including inside the bytecode dispatch loop's

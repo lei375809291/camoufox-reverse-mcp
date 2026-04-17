@@ -215,6 +215,18 @@ python -m camoufox_reverse_mcp \
 | `search_json_path` | **[新]** 按 JSON 路径提取响应数据（支持 `data[*].id` 通配） |
 
 ### JSVMP 逆向分析（新增模块）
+
+> **反爬类型 → 工具路径对照表**
+>
+> 不同类型的反爬要用不同的工具，用错会导致挑战永远过不去。先识别类型再选工具。
+>
+> | 反爬类型 | 代表 | ✅ 推荐路径 | ❌ 禁用 |
+> |---|---|---|---|
+> | **签名型**（环境即签名） | 瑞数 5/6、Akamai sensor_data v3+、Shape Security | `instrument_jsvmp_source(mode="ast")` + `analyze_cookie_sources()` | `pre_inject_hooks`、`hook_jsvmp_interpreter(mode="proxy")` |
+> | **行为型**（参数签名） | TikTok webmssdk、极验 gt4 | `hook_jsvmp_interpreter(mode="proxy")` 全量开 | — |
+> | **纯混淆** | obfuscator.io、自研 VMP 无反指纹 | 任意组合 | — |
+>
+> **识别方法**：先 `navigate()`（不加 pre_inject），看 `redirect_chain`。出现重复 412 或 302 循环 → 签名型，走源码插桩。
 | 工具 | 说明 |
 |------|------|
 | `hook_jsvmp_interpreter` | **[增强]** 通用 JSVMP 运行时探针：覆盖 apply/call/bind + Reflect.* + Proxy 属性追踪 |

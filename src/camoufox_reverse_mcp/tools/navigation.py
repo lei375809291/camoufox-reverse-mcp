@@ -105,6 +105,16 @@ async def navigate(
                 - "runtime_probe"     - full runtime_probe.js
             Hooks are registered at context level, then the page is navigated
             and automatically reloaded so hooks are active from the start.
+
+            WARNING: pre-injected probes modify the runtime environment
+            (Proxy on navigator/screen, Function.prototype.apply/call
+            overrides). For signature-based anti-bot systems where the
+            environment fingerprint feeds into a hash (Rui Shu sdenv,
+            Akamai sensor_data), this WILL cause the challenge to fail.
+            Symptoms: navigate never completes, redirect_chain shows
+            repeated 412 responses with no 200. For those sites, use
+            instrument_jsvmp_source() instead — it rewrites the JS source
+            without touching the environment.
         collect_response_chain: If True (default), record every response
             during this navigation so final_status reflects JS-driven
             redirects (Rui Shu 412 -> 200 after cookie challenge).

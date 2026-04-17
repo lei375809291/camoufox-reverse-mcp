@@ -203,6 +203,18 @@ python -m camoufox_reverse_mcp \
 - `search_json_path` — **[New]** Extract JSON data by dot-notation path (`data[*].id` wildcard)
 
 ### JSVMP Reverse Analysis
+
+> **Anti-Bot Type → Tool Path Decision Table**
+>
+> Different anti-bot types require different tools. Using the wrong one causes the challenge to never pass.
+>
+> | Anti-Bot Type | Examples | ✅ Recommended | ❌ Do NOT Use |
+> |---|---|---|---|
+> | **Signature-based** (env = signature) | Rui Shu 5/6, Akamai sensor_data v3+, Shape Security | `instrument_jsvmp_source(mode="ast")` + `analyze_cookie_sources()` | `pre_inject_hooks`, `hook_jsvmp_interpreter(mode="proxy")` |
+> | **Behavior-based** (param signature) | TikTok webmssdk, GeeTest gt4 | `hook_jsvmp_interpreter(mode="proxy")` full coverage | — |
+> | **Pure obfuscation** | obfuscator.io, custom VMP without fingerprinting | Any combination | — |
+>
+> **How to identify**: `navigate()` without pre_inject, check `redirect_chain`. Repeated 412 or 302 loops → signature-based, use source instrumentation.
 - `hook_jsvmp_interpreter` — **[Enhanced]** Universal JSVMP runtime probe: apply/call/bind + Reflect.* + Proxy property tracking
 - `get_jsvmp_log` — Get JSVMP execution log (with API call stats & property summary)
 - `dump_jsvmp_strings` — **[Fixed]** Extract JSVMP string table: manual bracket matching, no more regex hangs

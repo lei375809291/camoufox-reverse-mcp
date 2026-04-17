@@ -24,14 +24,36 @@ async def hook_jsvmp_interpreter(
     objects (navigator, screen, etc.), and intercepts timing/random APIs.
 
     Works on:
-        - Rui Shu 5/6 (while+switch bytecode dispatch + direct calls)
-        - Akamai sensor_data v2/v3+
-        - TikTok webmssdk.es5
+        - TikTok webmssdk.es5 (parameter-based signature)
         - obfuscator.io style VMPs
         - Custom VMPs using Reflect.* or direct invocation
+        - Any VMP that does NOT hash the environment into a cookie/signature
 
     Scope: broad runtime probe. For VMP internals that bypass all hookable
     JS APIs, use instrument_jsvmp_source for source-level instrumentation.
+
+    LIMITATIONS — READ BEFORE USING:
+        This tool installs Proxies on global objects (navigator, screen, ...)
+        and overrides Function.prototype.apply/call/bind. These modifications
+        are DETECTABLE by any JS that:
+          - Compares Function.prototype.apply.toString() against a known
+            native pattern
+          - Inspects Object.getOwnPropertyDescriptors(navigator) shape
+          - Uses navigator as input to a cryptographic hash (sensor_data,
+            Rui Shu sdenv fingerprinting)
+
+        For "environment-as-signature" anti-bot systems (Rui Shu 5/6,
+        Akamai sensor_data v3+, Shape Security), this tool IS NOT
+        RECOMMENDED. The observation changes the environment, the computed
+        signature diverges from what the server expects, and the challenge
+        never passes (symptoms: repeated 412 in redirect_chain).
+
+        Recommended alternatives for signature-based anti-bot:
+          1. instrument_jsvmp_source(mode="ast") — rewrites JS source,
+             leaves the environment untouched. Signature stays valid.
+          2. hook_jsvmp_interpreter(mode="transparent") — uses prototype-
+             getter replacement only; no Proxy, no Function.prototype
+             changes. Lower coverage but typically undetectable.
 
     Args:
         script_url: Target script URL substring for stack filtering. Empty
