@@ -344,37 +344,76 @@ async def get_property_access_log(
 
 @mcp.tool()
 async def remove_hooks(keep_persistent: bool = False) -> dict:
-    """Remove all injected hooks by reloading the page.
+    """Remove installed hooks and restore original objects in-place.
+
+    Calls window.__mcp_jsvmp_uninstall() / __mcp_transparent_uninstall()
+    in the page to restore Proxied navigator/screen/... to their original
+    references. Does NOT rely on page reload (preserves session state).
 
     Args:
-        keep_persistent: If True, persistent (context-level) hooks will be
-            preserved and re-applied after reload. If False, all hooks
-            including persistent ones are removed.
+        keep_persistent: If True, keep persistent init_scripts registered
+            so future navigations re-install hooks. If False (default),
+            also clear the persistent script registry.
 
     Returns:
-        dict with status after reload.
+        dict with status, restored_objects, cleared counts, warnings.
     """
     try:
         page = await browser_manager.get_active_page()
-        browser_manager._init_scripts.clear()
+        warnings: list[str] = []
+        restored: list[str] = []
 
+        # Step 1: in-page uninstall
+        uninstall_js = r"""
+        (function() {
+          var out = { uninstalled: [], errors: [] };
+          if (typeof window.__mcp_jsvmp_uninstall === 'function') {
+            try {
+              var r = window.__mcp_jsvmp_uninstall();
+              out.uninstalled.push({ hook: 'jsvmp_proxy',
+                                     restored: (r && r.restored) || [] });
+            } catch (e) { out.errors.push('jsvmp_uninstall: ' + e.message); }
+          }
+          if (typeof window.__mcp_transparent_uninstall === 'function') {
+            try {
+              var r = window.__mcp_transparent_uninstall();
+              out.uninstalled.push({ hook: 'jsvmp_transparent',
+                                     restored: (r && r.restored) || [] });
+            } catch (e) { out.errors.push('transparent_uninstall: ' + e.message); }
+          }
+          return out;
+        })();
+        """
+        try:
+            in_page = await page.evaluate(uninstall_js)
+            for item in (in_page.get("uninstalled") or []):
+                hook = item.get("hook")
+                items = item.get("restored") or []
+                if items:
+                    restored.extend([f"{hook}:{n}" for n in items])
+                else:
+                    restored.append(hook)
+            for err in (in_page.get("errors") or []):
+                warnings.append(f"in-page uninstall: {err}")
+        except Exception as e:
+            warnings.append(f"in-page uninstall eval failed: {e}")
+
+        # Step 2: clear python-side state
+        cleared_init = len(browser_manager._init_scripts)
+        browser_manager._init_scripts.clear()
+        cleared_persistent = 0
         if not keep_persistent:
+            cleared_persistent = len(browser_manager._persistent_scripts)
             browser_manager._persistent_scripts.clear()
 
-        context = page.context
-        url = page.url
-        await page.close()
-
-        new_page = await context.new_page()
-        browser_manager._attach_listeners(new_page)
-        browser_manager.pages[browser_manager.active_page_name] = new_page
-
-        if url and url != "about:blank":
-            await new_page.goto(url)
-
-        return {"status": "hooks_removed", "url": url,
-                "persistent_kept": keep_persistent,
-                "persistent_count": len(browser_manager._persistent_scripts)}
+        return {
+            "status": "hooks_removed",
+            "restored_objects": restored,
+            "cleared_init_scripts": cleared_init,
+            "cleared_persistent_scripts": cleared_persistent if not keep_persistent else 0,
+            "persistent_kept": keep_persistent,
+            "warnings": warnings if warnings else None,
+        }
     except Exception as e:
         return {"error": str(e)}
 

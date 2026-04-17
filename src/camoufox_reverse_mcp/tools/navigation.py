@@ -96,6 +96,11 @@ async def navigate(
     Args:
         url: Target URL.
         wait_until: "load", "domcontentloaded", or "networkidle".
+            For SPA sites with continuous network activity, `networkidle`
+            will never fire — prefer `domcontentloaded`. v0.6.0: if
+            `load`/`networkidle` times out but DOM is interactive/complete,
+            navigate returns soft-success with `navigation_timed_out=True`
+            rather than hard failing.
         pre_inject_hooks: Optional list of hook preset names to register
             before navigation. Accepts any preset from inject_hook_preset
             ("xhr", "fetch", "crypto", "websocket", "debugger_bypass") and
@@ -149,7 +154,33 @@ async def navigate(
                     warnings.append(f"hook '{name}' failed: {msg}")
 
         # Step 2: Navigate normally to the target URL
-        resp = await page.goto(url, wait_until=wait_until)
+        navigation_timed_out = False
+        try:
+            resp = await page.goto(url, wait_until=wait_until, timeout=30000)
+        except Exception as e:
+            msg = str(e).lower()
+            if "timeout" in msg or "exceeded" in msg or "waiting" in msg:
+                warnings.append(
+                    f"goto timeout waiting for '{wait_until}'; checking if page is usable"
+                )
+                try:
+                    dom_ready = await page.evaluate("document.readyState")
+                    current_url = page.url
+                    if dom_ready in ("interactive", "complete") and current_url and current_url != "about:blank":
+                        warnings.append(
+                            f"page is usable (readyState={dom_ready}, url={current_url}); "
+                            "treating as soft success. "
+                            "Tip: for SPA sites with continuous network activity, "
+                            "prefer wait_until='domcontentloaded'."
+                        )
+                        resp = None
+                        navigation_timed_out = True
+                    else:
+                        raise
+                except Exception:
+                    raise
+            else:
+                raise
         initial_status = resp.status if resp else None
 
         # Step 3: If hooks were registered, reload so they fire before page JS
@@ -184,6 +215,7 @@ async def navigate(
             "redirect_chain": chain if collect_response_chain else None,
             "hooks_injected": hooks_injected,
             "reloaded": reloaded,
+            "navigation_timed_out": navigation_timed_out,
             "warnings": warnings if warnings else None,
         }
     except Exception as e:

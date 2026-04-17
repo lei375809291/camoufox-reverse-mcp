@@ -26,6 +26,52 @@ from ..utils.ast_rewriter import ast_rewrite as _ast_rewrite_py
 _active_routes: dict[str, dict] = {}
 
 
+async def _detect_csp_risk(page) -> dict:
+    """Detect if the page's CSP would block injected inline runtime."""
+    try:
+        probe = await page.evaluate(r"""
+          (async () => {
+            return new Promise(resolve => {
+              var marker = '__mcp_csp_probe_' + Math.random().toString(36).slice(2);
+              var s = document.createElement('script');
+              s.textContent = 'window["' + marker + '"] = 1;';
+              var violated = false;
+              var handler = function(e) {
+                if (e.violatedDirective && e.violatedDirective.indexOf('script-src') !== -1) {
+                  violated = true;
+                }
+              };
+              document.addEventListener('securitypolicyviolation', handler, { once: true });
+              try { document.head.appendChild(s); } catch (e) {}
+              try { document.head.removeChild(s); } catch (e) {}
+              setTimeout(() => {
+                document.removeEventListener('securitypolicyviolation', handler);
+                var ran = window[marker] === 1;
+                try { delete window[marker]; } catch (e) {}
+                var meta = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+                resolve({
+                  ran: ran,
+                  violated: violated,
+                  csp_meta: meta ? meta.content : null
+                });
+              }, 80);
+            });
+          })()
+        """)
+    except Exception:
+        return {"blocks": False, "csp_meta": None, "reasons": []}
+
+    reasons: list[str] = []
+    blocks = bool(probe.get("violated") or not probe.get("ran"))
+    if blocks:
+        reasons.append("inline <script> execution blocked or violated CSP")
+    csp_meta = probe.get("csp_meta")
+    if csp_meta and "unsafe-inline" not in csp_meta:
+        reasons.append(f"CSP meta missing 'unsafe-inline': {str(csp_meta)[:200]}")
+
+    return {"blocks": blocks, "csp_meta": csp_meta, "reasons": reasons}
+
+
 @mcp.tool()
 async def instrument_jsvmp_source(
     url_pattern: str,
@@ -36,18 +82,23 @@ async def instrument_jsvmp_source(
     max_rewrites: int = 20000,
     cache_rewritten: bool = True,
     fallback_on_error: bool = True,
+    ignore_csp: bool = False,
 ) -> dict:
     """Intercept a JSVMP script and instrument its source at the HTTP layer.
 
-    ★ RECOMMENDED DEFAULT for signature-based anti-bot (Rui Shu, Akamai,
-    Shape Security). Unlike runtime hooks, this tool rewrites the JS source
-    before the browser executes it. The environment stays pristine — the
-    VMP reads the real navigator, computes the real signature, and the
-    server accepts it. Meanwhile every internal operation of the VMP is
-    logged through the injected taps.
+    ★ RECOMMENDED DEFAULT for signature-based anti-bot systems. Unlike
+    runtime hooks, this tool rewrites the JS source before the browser
+    executes it. The environment stays pristine — the VMP reads the real
+    navigator, computes the real signature, and the server accepts it.
+    Meanwhile every internal operation of the VMP is logged through the
+    injected taps.
 
     This is the only observation technique compatible with cookie/signature
     schemes that hash environment properties.
+
+    v0.6.0: Pre-flight CSP check — if the page's CSP blocks inline script
+    execution, refuses to register (because the injected tap runtime would
+    be silently dropped) and recommends alternatives.
 
     Args:
         url_pattern: Glob pattern matching the VMP script URL(s), e.g.:
@@ -73,6 +124,8 @@ async def instrument_jsvmp_source(
         fallback_on_error: If mode="ast" and AST parse fails, automatically
             retry with regex mode instead of shipping unmodified source
             (default True).
+        ignore_csp: If True, skip the CSP pre-flight check. Use only when
+            you've verified the rewrite works on this site (rare).
 
     Returns:
         dict with status and pattern. The actual rewrite happens when the
@@ -80,6 +133,26 @@ async def instrument_jsvmp_source(
     """
     try:
         page = await browser_manager.get_active_page()
+
+        if not ignore_csp:
+            csp = await _detect_csp_risk(page)
+            if csp["blocks"]:
+                return {
+                    "status": "refused_csp_blocks_inline",
+                    "csp_meta": csp.get("csp_meta"),
+                    "reasons": csp["reasons"],
+                    "recommended": (
+                        "This page's CSP blocks the injected tap runtime. "
+                        "Source rewrite would succeed but log output would be empty. "
+                        "Alternatives:\n"
+                        "  1) hook_jsvmp_interpreter(mode='transparent') — patches "
+                        "     prototype getters in-memory, no inline script needed\n"
+                        "  2) hook_function(function_path=...) — patches specific "
+                        "     functions in-memory\n"
+                        "  3) pass ignore_csp=True to skip this check"
+                    ),
+                }
+
         cache: dict[str, str] = {}
         stats = {"files_rewritten": 0, "total_edits": 0, "last_url": None,
                  "last_mode_used": None}

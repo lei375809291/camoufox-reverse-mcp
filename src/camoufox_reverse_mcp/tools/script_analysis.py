@@ -163,80 +163,108 @@ async def search_code(keyword: str, max_results: int = 50) -> dict:
 async def search_code_in_script(
     script_url: str,
     keyword: str,
-    max_results: int = 100,
+    context_lines: int = 3,
+    context_chars: int = 200,
+    max_results: int = 200,
 ) -> dict:
     """Search for a keyword within a specific script file.
 
-    More targeted than search_code — avoids scanning all scripts and provides
-    more results from the target script.
+    v0.6.0: Auto-detects single-line / minified files (<10 lines or any
+    line >5000 chars) and returns CHARACTER-BASED context windows
+    (keyword ± context_chars) instead of line-based. Critical for minified
+    JSVMP files (single-line, 240KB+).
 
     Args:
         script_url: URL of the script to search in. Use "inline:<index>" for
             inline scripts.
         keyword: The keyword to search for (case-sensitive substring match).
-        max_results: Maximum number of matches (default 100).
+        context_lines: Context window in line mode (default 3).
+        context_chars: Context window in char mode (default 200 = ±200 chars).
+        max_results: Maximum number of matches (default 200).
 
     Returns:
-        dict with matches list, total_matches count, and script info.
+        dict with total_matches, returned, mode ("line" | "char"), results.
     """
+    import json as _json
     try:
         page = await browser_manager.get_active_page()
-        escaped_url = repr(script_url)
-        escaped_keyword = repr(keyword)
 
-        results = await page.evaluate(f"""async () => {{
-            const scriptUrl = {escaped_url};
-            const keyword = {escaped_keyword};
-            const maxResults = {max_results};
-            let source = '';
-
-            if (scriptUrl.startsWith('inline:')) {{
-                const idx = parseInt(scriptUrl.split(':')[1]);
+        if script_url.startswith("inline:"):
+            idx = int(script_url.split(":")[1])
+            src = await page.evaluate(f"""() => {{
                 const scripts = document.querySelectorAll('script');
-                source = scripts[idx] ? (scripts[idx].textContent || '') : '';
-                if (!source) return {{ error: 'Inline script not found at index ' + idx }};
-            }} else {{
-                try {{
-                    const resp = await fetch(scriptUrl);
-                    source = await resp.text();
-                }} catch(e) {{
-                    return {{ error: 'Failed to fetch script: ' + e.message }};
-                }}
-            }}
+                return scripts[{idx}] ? (scripts[{idx}].textContent || '') : null;
+            }}""")
+            if src is None:
+                return {"error": f"Inline script not found at index {idx}"}
+        else:
+            src = await page.evaluate(
+                f"fetch({_json.dumps(script_url)}, {{cache: 'force-cache'}}).then(r => r.text())"
+            )
 
-            const lines = source.split('\\n');
-            const matches = [];
-            let totalMatches = 0;
+        if not isinstance(src, str):
+            return {"error": f"script not fetchable: got {type(src).__name__}"}
 
-            for (let i = 0; i < lines.length; i++) {{
-                if (lines[i].includes(keyword)) {{
-                    totalMatches++;
-                    if (matches.length < maxResults) {{
-                        const start = Math.max(0, i - 3);
-                        const end = Math.min(lines.length, i + 4);
-                        const contextStr = lines.slice(start, end).join('\\n');
-                        matches.push({{
-                            line_number: i + 1,
-                            match: lines[i].trim().substring(0, 500),
-                            context: contextStr.length > 3000
-                                ? contextStr.substring(0, 3000) + '...(truncated)'
-                                : contextStr
-                        }});
-                    }}
-                }}
-            }}
+        lines = src.split("\n")
+        max_line_len = max((len(l) for l in lines), default=0)
+        use_char_mode = len(lines) < 10 or max_line_len > 5000
 
-            return {{
-                script_url: scriptUrl,
-                source_length: source.length,
-                total_lines: lines.length,
-                matches: matches,
-                total_matches: totalMatches,
-                returned_matches: matches.length,
-                truncated: totalMatches > matches.length
-            }};
-        }}""")
-        return results
+        results: list[dict] = []
+        total = 0
+
+        if use_char_mode:
+            i = 0
+            while True:
+                pos = src.find(keyword, i)
+                if pos == -1:
+                    break
+                total += 1
+                if len(results) < max_results:
+                    start = max(0, pos - context_chars)
+                    end = min(len(src), pos + len(keyword) + context_chars)
+                    results.append({
+                        "position": pos,
+                        "context_start": start,
+                        "context_end": end,
+                        "context": src[start:end],
+                        "match_highlight_range": [pos - start, pos - start + len(keyword)],
+                    })
+                i = pos + len(keyword)
+
+            return {
+                "total_matches": total,
+                "returned": len(results),
+                "script_url": script_url,
+                "mode": "char",
+                "source_size": len(src),
+                "total_lines": len(lines),
+                "max_line_length": max_line_len,
+                "context_chars": context_chars,
+                "results": results,
+            }
+
+        # Line-based mode
+        for idx, line in enumerate(lines):
+            if keyword in line:
+                total += 1
+                if len(results) < max_results:
+                    start = max(0, idx - context_lines)
+                    end = min(len(lines), idx + context_lines + 1)
+                    ctx = "\n".join(lines[start:end])
+                    results.append({
+                        "line": idx + 1,
+                        "context": ctx[:3000] + ("...(truncated)" if len(ctx) > 3000 else ""),
+                        "context_range": [start + 1, end],
+                    })
+
+        return {
+            "total_matches": total,
+            "returned": len(results),
+            "script_url": script_url,
+            "mode": "line",
+            "total_lines": len(lines),
+            "results": results,
+        }
     except Exception as e:
         return {"error": str(e)}
 

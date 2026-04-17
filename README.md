@@ -415,6 +415,23 @@ AI 操作链：
 
 ## 更新记录
 
+### v0.6.0（2026-04-18）— 实战 Bug 修复 + 可用性补强
+
+> 纯 bug fix + 可用性补强，不增加新工具。工具总数保持 65。
+
+**P0 修复**
+- `hook_jsvmp_interpreter(mode="proxy")` 在 C++ 级 navigator getter 上装 Proxy 导致 `too much recursion` — 新增 per-proxy 重入守卫 + 原始对象备份
+- `remove_hooks` 不能真正清理已装 Proxy — 现在调用 `__mcp_jsvmp_uninstall()` / `__mcp_transparent_uninstall()` 恢复原始对象，不再需要 `close_browser`
+- `evaluate_js` 对 `JSON.stringify()` 返回值解析失败（BOM / lone surrogate / whitespace）— 返回前自动清理，失败时自动回落 `evaluate_handle` 路径
+
+**P1 改进**
+- `instrument_jsvmp_source` 新增 CSP 预检，严格 CSP 站点改写前返回 `refused_csp_blocks_inline` 并建议替代方案，避免"改写成功但无日志"的静默失败；可传 `ignore_csp=True` 跳过
+- `search_code_in_script` 检测单行/压缩文件（<10 行或最长行 >5000 字符）时返回字符窗口（keyword ± context_chars），解决大型压缩文件上下文无用问题
+- `navigate` 超时优雅降级：SPA 站点 `load`/`networkidle` 超时但 DOM 已就绪时返回 `navigation_timed_out=True` 的软成功而非抛错
+
+**P2 改进**
+- `get_request_initiator` 对 fetch 请求新增 `fetch_hook.js` 日志兜底，`source` 字段标注使用的是 `native`/`xhr`/`fetch`/`fetch_hook`
+
 ### v0.5.0（2026-04-18）— 签名型反爬兼容改造
 
 > 解决 `pre_inject_hooks` 对瑞数/Akamai 签名型反爬不可用的架构性问题。新增 MCP 侧 AST 改写、transparent 观察模式、反爬类型决策表和实战 Playbook。

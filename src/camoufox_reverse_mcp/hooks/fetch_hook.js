@@ -16,6 +16,23 @@
             stack: new Error().stack,
             timestamp: Date.now()
         };
+
+        // v0.6.0: dedicated initiator log for get_request_initiator fallback
+        window.__mcp_fetch_initiator_log = window.__mcp_fetch_initiator_log || [];
+        try {
+            var _stack = '';
+            try { _stack = new Error().stack || ''; } catch (e) {}
+            window.__mcp_fetch_initiator_log.push({
+                url: String(url),
+                method: method,
+                stack: _stack.split('\n').slice(0, 15).join('\n'),
+                ts: Date.now()
+            });
+            if (window.__mcp_fetch_initiator_log.length > 500) {
+                window.__mcp_fetch_initiator_log.shift();
+            }
+        } catch (e) {}
+
         try {
             const response = await _fetch.apply(this, arguments);
             info.status = response.status;

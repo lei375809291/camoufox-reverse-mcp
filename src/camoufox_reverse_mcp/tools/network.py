@@ -137,6 +137,11 @@ async def get_request_initiator(request_id: int) -> dict:
     Golden path: see encrypted param → get_request_initiator → find signing function.
     Requires inject_hook_preset("xhr"/"fetch") BEFORE navigating.
 
+    v0.6.0: If Playwright-native initiator is unavailable (common for fetch
+    on Firefox), automatically tries window.__mcp_fetch_initiator_log
+    (requires fetch_hook.js). Returns source="native"|"fetch_hook"|"xhr_hook"
+    so callers know which path succeeded.
+
     Args:
         request_id: The ID of the request.
     """
@@ -187,18 +192,45 @@ async def get_request_initiator(request_id: int) -> dict:
                 return null;
             }}
 
+            // Try XHR hook log
             const xhrResult = searchLogs(window.__mcp_xhr_log, 'xhr');
             if (xhrResult) return xhrResult;
 
+            // Try fetch hook log (general)
             const fetchResult = searchLogs(window.__mcp_fetch_log, 'fetch');
             if (fetchResult) return fetchResult;
 
+            // v0.6.0: Try dedicated fetch initiator log (has cleaner stacks)
+            const fetchInitLog = window.__mcp_fetch_initiator_log || [];
+            for (let i = fetchInitLog.length - 1; i >= 0; i--) {{
+                const entry = fetchInitLog[i];
+                const logUrl = entry.url || '';
+                if (reqUrl === logUrl || reqUrl.includes(logUrl) || logUrl.includes(reqUrl)) {{
+                    return {{
+                        url: logUrl,
+                        stack: entry.stack || null,
+                        type: 'fetch_hook',
+                        method: entry.method,
+                        timestamp: entry.ts
+                    }};
+                }}
+                try {{
+                    const u1 = new URL(reqUrl, location.origin);
+                    const u2 = new URL(logUrl, location.origin);
+                    if (u1.pathname === u2.pathname && u1.host === u2.host) {{
+                        return {{
+                            url: logUrl, stack: entry.stack || null, type: 'fetch_hook',
+                            method: entry.method, timestamp: entry.ts
+                        }};
+                    }}
+                }} catch(e) {{}}
+            }}
+
             const hasXhrHook = !!window.__mcp_xhr_hooked;
-            const hasXhrLog = Array.isArray(window.__mcp_xhr_log);
-            const xhrLogCount = hasXhrLog ? window.__mcp_xhr_log.length : 0;
             const hasFetchHook = !!window.__mcp_fetch_hooked;
-            const hasFetchLog = Array.isArray(window.__mcp_fetch_log);
-            const fetchLogCount = hasFetchLog ? window.__mcp_fetch_log.length : 0;
+            const xhrLogCount = Array.isArray(window.__mcp_xhr_log) ? window.__mcp_xhr_log.length : 0;
+            const fetchLogCount = Array.isArray(window.__mcp_fetch_log) ? window.__mcp_fetch_log.length : 0;
+            const fetchInitCount = fetchInitLog.length;
 
             return {{
                 url: reqUrl,
@@ -209,9 +241,10 @@ async def get_request_initiator(request_id: int) -> dict:
                     xhr_log_entries: xhrLogCount,
                     fetch_hook_active: hasFetchHook,
                     fetch_log_entries: fetchLogCount,
+                    fetch_initiator_entries: fetchInitCount,
                     hint: !hasXhrHook && !hasFetchHook
-                        ? 'No hooks detected. Call inject_hook_preset("xhr") and inject_hook_preset("fetch") with persistent=True BEFORE navigating to the page.'
-                        : 'Hooks are active but no matching log entry found. The request may have been initiated by a Service Worker or other non-hookable mechanism.'
+                        ? 'No hooks detected. Call inject_hook_preset("xhr") and inject_hook_preset("fetch") with persistent=True BEFORE navigating.'
+                        : 'Hooks active but no matching URL found in logs.'
                 }}
             }};
         }}""")
@@ -220,6 +253,7 @@ async def get_request_initiator(request_id: int) -> dict:
             "url": result.get("url"),
             "initiator_stack": result.get("stack"),
             "initiator_type": result.get("type"),
+            "source": result.get("type", "unknown"),
             "method": result.get("method"),
             "request_headers": result.get("headers"),
             "request_body": result.get("body"),

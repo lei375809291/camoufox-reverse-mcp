@@ -357,6 +357,23 @@ AI workflow:
 
 ## Changelog
 
+### v0.6.0 (2026-04-18) — Bug Fixes + Usability
+
+> Pure bug fix + usability improvements. No new tools. Tool count stays at 65.
+
+**P0 Fixes**
+- `hook_jsvmp_interpreter(mode="proxy")`: per-proxy reentrance guard prevents `too much recursion` on C++ engine-level getters
+- `remove_hooks`: calls in-page `__mcp_jsvmp_uninstall()` to truly restore Proxied objects without `close_browser`
+- `evaluate_js`: auto-cleans BOM/surrogates/whitespace in JSON returns, auto-fallback to handle path on serialization errors
+
+**P1 Improvements**
+- `instrument_jsvmp_source`: CSP pre-flight check, returns `refused_csp_blocks_inline` on strict CSP sites
+- `search_code_in_script`: char-mode context for minified single-line files (keyword ± context_chars)
+- `navigate`: graceful timeout — returns `navigation_timed_out=True` soft-success when DOM is ready but `load`/`networkidle` times out
+
+**P2**
+- `get_request_initiator`: fetch_hook.js initiator log fallback, `source` field indicates path used
+
 ### v0.5.0 (2026-04-18) — Signature-Based Anti-Bot Compatibility
 
 > Fix the architectural issue where `pre_inject_hooks` breaks signature-based anti-bot (Rui Shu/Akamai). Add MCP-side AST rewriting, transparent observation mode, anti-bot type decision table, and JSVMP Playbook.
