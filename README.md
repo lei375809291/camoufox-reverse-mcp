@@ -151,7 +151,7 @@ python -m camoufox_reverse_mcp \
 
 ---
 
-## 可用工具一览（57 个）
+## 可用工具一览（65 个）
 
 ### 导航 & 页面
 | 工具 | 说明 |
@@ -195,7 +195,7 @@ python -m camoufox_reverse_mcp \
 | `trace_function` | 追踪函数调用（**支持 persistent 持久化，跨导航数据不丢失**） |
 | `get_trace_data` | 获取追踪数据（**合并页面内数据和持久化数据**） |
 | `hook_function` | 注入自定义 Hook（before/after/replace，**支持 non_overridable 防覆盖**） |
-| `inject_hook_preset` | 一键注入预置 Hook（**默认 persistent=True 持久化**） |
+| `inject_hook_preset` | 一键注入预置 Hook（xhr/fetch/crypto/websocket/debugger_bypass/cookie/runtime_probe，**默认 persistent=True 持久化**） |
 | `trace_property_access` | **[新]** 追踪属性访问（Proxy 级别），揭示 JSVMP 读取的环境信息 |
 | `get_property_access_log` | **[新]** 获取属性访问记录 |
 | `remove_hooks` | 移除所有 Hook（**可选保留持久化 Hook**） |
@@ -217,10 +217,31 @@ python -m camoufox_reverse_mcp \
 ### JSVMP 逆向分析（新增模块）
 | 工具 | 说明 |
 |------|------|
-| `hook_jsvmp_interpreter` | **[新]** JSVMP 解释器插桩：追踪 API 调用和属性读取 |
-| `get_jsvmp_log` | **[新]** 获取 JSVMP 执行日志（含 API 调用统计和属性读取摘要） |
-| `dump_jsvmp_strings` | **[新]** 提取 JSVMP 字符串表：解密混淆字符串，发现 API 名称 |
-| `compare_env` | **[新]** 浏览器环境指纹收集：用于与 Node.js/jsdom 环境对比 |
+| `hook_jsvmp_interpreter` | **[增强]** 通用 JSVMP 运行时探针：覆盖 apply/call/bind + Reflect.* + Proxy 属性追踪 |
+| `get_jsvmp_log` | 获取 JSVMP 执行日志（含 API 调用统计和属性读取摘要） |
+| `dump_jsvmp_strings` | **[修复]** 提取 JSVMP 字符串表：手动括号匹配替代正则，不再死循环 |
+| `compare_env` | 浏览器环境指纹收集：用于与 Node.js/jsdom 环境对比 |
+| `find_dispatch_loops` | **[新]** 扫描脚本定位字节码分发函数（while+switch） |
+
+### JSVMP 源码级插桩（通用 VMP 利器）
+| 工具 | 说明 |
+|------|------|
+| `instrument_jsvmp_source` | **[新]** 在 JS 下载后、执行前改写源码，对每个 obj[key] / fn(args) 插入 tap，捕获字节码分发循环的每次外部交互。**通用方案**，对瑞数 5/6、akamai sensor_data、webmssdk、obfuscator.io 都有效 |
+| `get_instrumentation_log` | **[新]** 获取源码级插桩日志，带 hot_keys / hot_methods / hot_functions 摘要 |
+| `get_instrumentation_status` | **[新]** 查看当前激活的源码级插桩 |
+| `stop_instrumentation` | **[新]** 停止一个或全部源码插桩 |
+
+### Cookie 归因分析
+| 工具 | 说明 |
+|------|------|
+| `analyze_cookie_sources` | **[新]** 归因每个 Cookie 来源：HTTP Set-Cookie / JS document.cookie，解决"为什么我 hook 不到 cookie 写入"疑惑 |
+
+### 导航增强
+| 工具 | 说明 |
+|------|------|
+| `navigate` | **[增强]** 支持 pre_inject_hooks 在页面 JS 前装 hook、返回 initial_status + final_status + redirect_chain |
+| `reload_with_hooks` | **[新]** 重载页面让 persistent hooks 在页面 JS 前执行（清空日志） |
+| `get_runtime_probe_log` | **[新]** 获取 runtime_probe.js 捕获的广谱运行时事件 |
 
 ### 存储管理
 | 工具 | 说明 |
@@ -321,6 +342,37 @@ AI 操作链：
 9. get_page_content()                             ← 一键导出渲染后 HTML + 可见文本
 ```
 
+### 场景 6：通用 JSVMP 逆向（瑞数6 / Akamai / 自研 VMP）
+
+这是最推荐的 JSVMP 分析流程，不依赖 VMP 实现细节，对几乎所有类型有效。
+
+```
+AI 操作链：
+1. launch_browser(headless=False)
+2. start_network_capture(capture_body=True)
+3. # 第一次导航用来定位 VMP 脚本 URL
+   navigate("https://target.com/")
+4. list_network_requests(resource_type="script")
+5. # 找到可疑的大型 JS（通常 100KB+），如 sdenv-*.js / FuckCookie_*.js
+6. find_dispatch_loops(script_url="https://target.com/sdenv-xxx.js")
+   # 确认是 VMP（case_count 通常 >50）
+7. # 装源码级插桩
+   instrument_jsvmp_source("**/sdenv-*.js", mode="ast", tag="vmp1")
+8. # 同时装其他兜底 hook
+   inject_hook_preset("cookie", persistent=True)
+   inject_hook_preset("xhr", persistent=True)
+9. # 重新跑一次，让插桩生效
+   reload_with_hooks()
+10. # 看 VMP 访问了哪些环境信息
+    get_instrumentation_log(tag_filter="vmp1", type_filter="tap_get", limit=100)
+    # hot_keys 会揭示 userAgent / webdriver / plugins 等访问频次
+11. # 看 VMP 调用了哪些 API
+    get_instrumentation_log(tag_filter="vmp1", type_filter="tap_method")
+12. # 归因 Cookie 来源
+    analyze_cookie_sources()
+13. # 根据插桩数据在 Node.js / jsdom 侧补齐环境差异，跑通算法
+```
+
 ---
 
 ## 技术架构
@@ -348,6 +400,30 @@ AI 操作链：
 ```
 
 ## 更新记录
+
+### v0.4.0（2026-04-17）— 通用 JSVMP 适配改造
+
+> 让本 MCP 成为通用 JSVMP 逆向武器。新增源码级插桩、Cookie 归因、运行时探针等核心能力，修复 jsvmp_hook 多路径覆盖和 dump_jsvmp_strings 正则问题。工具总数从 57 个增长至 65 个。
+
+**新增工具（8 个）**
+| 工具 | 说明 |
+|------|------|
+| `instrument_jsvmp_source` | 源码级插桩：在 JS 下载后执行前改写源码，对每个 obj[key] / fn(args) 插入 tap |
+| `get_instrumentation_log` | 获取源码级插桩日志，带 hot_keys / hot_methods / hot_functions 摘要 |
+| `get_instrumentation_status` | 查看当前激活的源码级插桩 |
+| `stop_instrumentation` | 停止一个或全部源码插桩 |
+| `find_dispatch_loops` | 扫描脚本定位字节码分发函数（while+switch） |
+| `reload_with_hooks` | 重载页面让 persistent hooks 在页面 JS 前执行 |
+| `analyze_cookie_sources` | 归因每个 Cookie 来源：HTTP Set-Cookie / JS document.cookie |
+| `get_runtime_probe_log` | 获取 runtime_probe.js 捕获的广谱运行时事件 |
+
+**重大改进**
+- **hook_jsvmp_interpreter 重写**：多路径覆盖 apply/call/bind + Reflect.apply/get/set/construct + Proxy 属性追踪 + 计时/随机 API，对瑞数 6、Akamai、webmssdk 等 VMP 有效
+- **navigate 增强**：支持 `pre_inject_hooks` 在页面 JS 前装 hook、返回 `initial_status` + `final_status` + `redirect_chain`，解决 412 挑战页 status 歧义
+- **dump_jsvmp_strings 修复**：用手动括号匹配替代嵌套正则，不再死循环或漏匹配
+- **新增 cookie_hook.js**：原型链级 document.cookie hook，正确处理 Document.prototype 上的 descriptor
+- **新增 runtime_probe.js**：低开销广谱运行时观察器，覆盖 XHR/fetch/canvas/WebGL/navigator/addEventListener
+- **inject_hook_preset 新增预设**：`cookie`、`runtime_probe`
 
 ### v0.3.0（2026-04-03）— 稳定性修复 + 响应体检索 + DOM 导出 + 会话管理
 

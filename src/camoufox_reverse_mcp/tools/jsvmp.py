@@ -8,48 +8,100 @@ from ..server import mcp, browser_manager
 
 @mcp.tool()
 async def hook_jsvmp_interpreter(
-    script_url: str,
+    script_url: str = "",
     persistent: bool = True,
+    track_calls: bool = True,
+    track_props: bool = True,
+    track_reflect: bool = True,
+    proxy_objects: list[str] | None = None,
+    max_entries: int = 10000,
 ) -> dict:
-    """Instrument a JSVMP-protected script to trace its interpreter execution.
+    """Install a universal JSVMP runtime probe.
 
-    Automatically hooks Function.prototype.apply/call and sensitive browser
-    property reads to log all external interactions made by the JSVMP
-    interpreter. This reveals which browser APIs and environment properties
-    the VM accesses, without needing to reverse-engineer the bytecode.
+    Multi-path instrumentation that covers how JSVMP interpreters interact
+    with the host environment. Unlike simple apply-hook approaches, this
+    probe also wraps Reflect.get/apply, installs Proxies on critical global
+    objects (navigator, screen, etc.), and intercepts timing/random APIs.
+
+    Works on:
+        - Rui Shu 5/6 (while+switch bytecode dispatch + direct calls)
+        - Akamai sensor_data v2/v3+
+        - TikTok webmssdk.es5
+        - obfuscator.io style VMPs
+        - Custom VMPs using Reflect.* or direct invocation
+
+    Scope: broad runtime probe. For VMP internals that bypass all hookable
+    JS APIs, use instrument_jsvmp_source for source-level instrumentation.
 
     Args:
-        script_url: URL of the JSVMP-protected script (e.g. "webmssdk.es5.js").
-            Can be a partial URL — matching uses 'includes'.
-        persistent: If True (default), instrumentation survives page navigation.
+        script_url: Target script URL substring for stack filtering. Empty
+            string means "record every call from any script". Recommended:
+            pass the VMP file basename (e.g. "webmssdk.es5.js").
+        persistent: If True (default), survives navigation via context-level
+            init_script AND also injects into the current page immediately.
+        track_calls: Hook Function.prototype.apply/call/bind + Date.now etc.
+        track_props: Install Proxy on globals (navigator, screen, ...) to
+            catch every property read the VMP performs.
+        track_reflect: Hook Reflect.apply/get/set/construct (covers ES6 VMPs
+            that bypass Function.prototype.apply entirely).
+        proxy_objects: Global object names to wrap with Proxy. Default:
+            ["navigator", "screen", "history", "localStorage", "sessionStorage",
+             "performance"]. "document" is NOT included by default because
+            wrapping it often breaks pages; use cookie_hook for that.
+        max_entries: Log buffer cap (default 10000).
 
     Returns:
-        dict with status and the script being monitored.
+        dict with status, coverage summary, and data location.
     """
     try:
+        if proxy_objects is None:
+            proxy_objects = ["navigator", "screen", "history",
+                             "localStorage", "sessionStorage", "performance"]
+
         hooks_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks")
         with open(os.path.join(hooks_dir, "jsvmp_hook.js"), "r", encoding="utf-8") as f:
             template = f.read()
 
-        hook_js = template.replace("'{{SCRIPT_URL}}'", json.dumps(script_url))
+        hook_js = (template
+            .replace("{{SCRIPT_URL}}", script_url.replace('"', '\\"').replace("'", "\\'"))
+            .replace("{{MAX_ENTRIES}}", str(max_entries))
+            .replace("{{TRACK_CALLS}}", "true" if track_calls else "false")
+            .replace("{{TRACK_PROPS}}", "true" if track_props else "false")
+            .replace("{{TRACK_REFLECT}}", "true" if track_reflect else "false")
+            .replace("'{{PROXY_OBJECTS}}'", json.dumps(json.dumps(proxy_objects)))
+        )
+
+        page = await browser_manager.get_active_page()
 
         if persistent:
-            await browser_manager.add_persistent_script(f"jsvmp:{script_url}", hook_js)
-            page = await browser_manager.get_active_page()
+            await browser_manager.add_persistent_script(f"jsvmp_probe:{script_url or 'all'}", hook_js)
+
+        # 关键: 无论 persistent 与否,都对当前页面立即 evaluate,
+        # 保证后续 reload / 下一次请求时 hook 已经就位
+        try:
             await page.evaluate(hook_js)
-        else:
-            page = await browser_manager.get_active_page()
-            await page.evaluate(hook_js)
+        except Exception as e:
+            return {
+                "status": "partial",
+                "warning": f"Evaluate on current page failed (may have no page loaded yet): {e}",
+                "persistent": persistent,
+                "script_url": script_url,
+            }
 
         return {
             "status": "instrumented",
-            "script_url": script_url,
+            "script_url": script_url or "(all scripts)",
             "persistent": persistent,
-            "tracking": {
-                "api_calls": "Function.prototype.apply/call interception",
-                "property_reads": "navigator.*, screen.*, document.cookie, etc.",
-                "data_location": "window.__mcp_jsvmp_log",
+            "coverage": {
+                "function_prototype": track_calls,
+                "reflect_apis": track_reflect,
+                "property_proxies": track_props,
+                "proxy_objects": proxy_objects if track_props else [],
+                "timing_apis": track_calls,
             },
+            "data_location": "window.__mcp_jsvmp_log",
+            "note": "If your target script loads BEFORE this install, call "
+                    "reload_with_hooks() afterwards so the probe runs first.",
         }
     except Exception as e:
         return {"error": str(e)}
@@ -117,126 +169,246 @@ async def get_jsvmp_log(
 
 @mcp.tool()
 async def dump_jsvmp_strings(script_url: str) -> dict:
-    """Extract and decode strings from a JSVMP-protected script.
+    """Extract and categorize strings from a JSVMP-protected script.
 
-    Parses the script to find string arrays (common in JSVMP/OB obfuscation),
-    attempts to decode XOR-encrypted or shifted string tables, and returns
-    all readable strings. This reveals which API names, property names, and
-    constants the JSVMP interpreter uses internally.
+    Finds large string arrays (common in JSVMP/obfuscator), collects all
+    string literals, and flags suspicious VMP patterns (XOR decryption,
+    while+switch dispatch loops, eval/Function constructors).
 
     Args:
         script_url: URL of the JSVMP-protected script.
 
     Returns:
-        dict with decoded_strings, string_arrays found, and analysis info.
+        dict with string_arrays, decoded_strings, api_names, and
+        suspicious_patterns.
     """
     try:
         page = await browser_manager.get_active_page()
 
-        results = await page.evaluate(f"""async () => {{
-            const url = {json.dumps(script_url)};
+        # Write the entire extractor as a standalone function to avoid
+        # f-string + regex double-escaping issues
+        extractor = r"""
+        async (url) => {
             let source;
-            try {{
+            try {
                 const resp = await fetch(url);
                 source = await resp.text();
-            }} catch(e) {{
-                return {{ error: 'Failed to fetch script: ' + e.message }};
-            }}
+            } catch (e) {
+                return { error: 'Failed to fetch script: ' + e.message };
+            }
 
-            const results = {{
+            const results = {
                 script_url: url,
                 source_length: source.length,
                 string_arrays: [],
                 decoded_strings: [],
                 api_names: [],
                 suspicious_patterns: []
-            }};
+            };
 
-            // Pattern 1: Large array literals with strings
-            const arrayPattern = new RegExp('(?:var|let|const)\\\\s+(\\\\w+)\\\\s*=\\\\s*\\\\[((?:[^\\\\[\\\\]]*(?:\\\\[(?:[^\\\\[\\\\]]*\\\\])*[^\\\\[\\\\]]*)*?))\\\\]', 'g');
-            let match;
-            while ((match = arrayPattern.exec(source)) !== null) {{
-                const content = match[2];
-                const strings = [];
-                const strPattern = new RegExp('["\\']((?:[^"\\'\\\\\\\\]|\\\\\\\\.){{2,}})["\\']+', 'g');
-                let strMatch;
-                while ((strMatch = strPattern.exec(content)) !== null) {{
-                    strings.push(strMatch[1]);
-                }}
-                if (strings.length >= 10) {{
-                    results.string_arrays.push({{
-                        variable: match[1],
-                        count: strings.length,
-                        position: match.index,
-                        preview: strings.slice(0, 30)
-                    }});
-                    results.decoded_strings.push(...strings);
-                }}
-            }}
+            // Pattern 1: var/let/const X = [...]
+            // We scan manually with bracket matching to avoid regex depth issues
+            function findArrayLiterals(src) {
+                const arrs = [];
+                const re = /(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*\[/g;
+                let m;
+                while ((m = re.exec(src)) !== null) {
+                    const nameEnd = m.index + m[0].length - 1;
+                    let depth = 1, i = nameEnd + 1;
+                    while (i < src.length && depth > 0) {
+                        const c = src[i];
+                        if (c === '"' || c === "'" || c === '`') {
+                            const q = c;
+                            i++;
+                            while (i < src.length && src[i] !== q) {
+                                if (src[i] === '\\') i += 2;
+                                else i++;
+                            }
+                            i++;
+                        } else if (c === '[') { depth++; i++; }
+                        else if (c === ']') { depth--; i++; }
+                        else i++;
+                    }
+                    if (depth === 0) {
+                        arrs.push({ name: m[1], start: nameEnd, end: i,
+                                    body: src.slice(nameEnd + 1, i - 1) });
+                    }
+                }
+                return arrs;
+            }
 
-            // Pattern 2: String literals throughout the code
+            function extractQuotedStrings(body) {
+                const strs = [];
+                let i = 0;
+                while (i < body.length) {
+                    const c = body[i];
+                    if (c === '"' || c === "'") {
+                        const q = c;
+                        let s = '';
+                        i++;
+                        while (i < body.length && body[i] !== q) {
+                            if (body[i] === '\\' && i + 1 < body.length) {
+                                s += body[i] + body[i + 1];
+                                i += 2;
+                            } else {
+                                s += body[i];
+                                i++;
+                            }
+                        }
+                        i++;
+                        strs.push(s);
+                    } else {
+                        i++;
+                    }
+                }
+                return strs;
+            }
+
+            const arrays = findArrayLiterals(source);
+            for (const arr of arrays) {
+                const strs = extractQuotedStrings(arr.body);
+                if (strs.length >= 10) {
+                    results.string_arrays.push({
+                        variable: arr.name,
+                        count: strs.length,
+                        position: arr.start,
+                        preview: strs.slice(0, 30)
+                    });
+                    results.decoded_strings.push(...strs);
+                }
+            }
+
+            // Collect ALL string literals (bounded) for api-name detection
             const allStrings = new Set();
-            const literalPattern = new RegExp('["\\']((?:[^"\\'\\\\\\\\]|\\\\\\\\.){{3,100}})["\\']+', 'g');
-            while ((match = literalPattern.exec(source)) !== null) {{
-                const s = match[1];
-                try {{
-                    const decoded = JSON.parse('"' + s + '"');
-                    allStrings.add(decoded);
-                }} catch(e) {{
-                    allStrings.add(s);
-                }}
-            }}
+            const allLits = extractQuotedStrings(source);
+            for (const s of allLits) {
+                if (s.length >= 3 && s.length <= 100) {
+                    try {
+                        const d = JSON.parse('"' + s.replace(/"/g, '\\"') + '"');
+                        allStrings.add(d);
+                    } catch (e) { allStrings.add(s); }
+                }
+            }
 
-            // Filter for API-like names
-            const browserAPIs = ['navigator', 'screen', 'document', 'window', 'canvas',
-                'getContext', 'toDataURL', 'getImageData', 'createElement', 'querySelector',
-                'userAgent', 'platform', 'language', 'plugins', 'mimeTypes', 'webdriver',
-                'hardwareConcurrency', 'deviceMemory', 'vendor', 'appVersion',
-                'width', 'height', 'colorDepth', 'pixelDepth', 'availWidth', 'availHeight',
-                'cookie', 'referrer', 'domain', 'title', 'hidden', 'visibilityState',
-                'WebGL', 'getExtension', 'getParameter', 'getSupportedExtensions',
-                'AudioContext', 'createOscillator', 'createAnalyser',
-                'performance', 'timing', 'now',
-                'crypto', 'subtle', 'digest', 'getRandomValues',
-                'fetch', 'XMLHttpRequest', 'open', 'send', 'setRequestHeader',
-                'localStorage', 'sessionStorage', 'indexedDB',
-                'a_bogus', 'X-Bogus', 'msToken', '_signature', 'sign', 'token',
+            const apiKeywords = [
+                'navigator', 'screen', 'document', 'window', 'location',
+                'userAgent', 'platform', 'language', 'cookie', 'webdriver',
                 'encrypt', 'decrypt', 'hash', 'md5', 'sha256', 'hmac', 'aes', 'base64',
-                'fromCharCode', 'charCodeAt', 'btoa', 'atob', 'encodeURIComponent',
-                'toString', 'valueOf', 'constructor', 'prototype',
+                'fromCharCode', 'charCodeAt', 'btoa', 'atob',
+                'encodeURIComponent', 'toString', 'valueOf',
                 'apply', 'call', 'bind',
-                'getTimezoneOffset', 'toISOString', 'toLocaleString'
+                'getTimezoneOffset', 'toISOString', 'toLocaleString',
+                'addEventListener', 'dispatchEvent'
             ];
-
-            for (const s of allStrings) {{
-                if (browserAPIs.some(api => s.includes(api))) {{
+            for (const s of allStrings) {
+                if (apiKeywords.some(api => s.includes(api))) {
                     results.api_names.push(s);
-                }}
-            }}
+                }
+            }
 
-            // Pattern 3: Look for JSVMP-specific patterns
-            if (source.includes('while') && source.includes('switch') && source.length > 100000) {{
-                results.suspicious_patterns.push('JSVMP interpreter loop (while+switch)');
-            }}
-            if (source.includes('eval(') || source.includes('eval (')) {{
-                results.suspicious_patterns.push('eval usage detected');
-            }}
-            if (source.includes('Function(') || source.includes('Function (')) {{
+            // Suspicious patterns
+            if (source.length > 100000 &&
+                /while\s*\(\s*(?:!\s*!\s*\[\s*\]|true|1)\s*\)/.test(source) &&
+                /switch\s*\(/.test(source)) {
+                results.suspicious_patterns.push('JSVMP interpreter loop (while+switch, large source)');
+            }
+            if (/eval\s*\(/.test(source)) {
+                results.suspicious_patterns.push('eval() usage detected');
+            }
+            if (/\bnew\s+Function\s*\(/.test(source) || /\bFunction\s*\(\s*['"]/.test(source)) {
                 results.suspicious_patterns.push('Dynamic Function constructor');
-            }}
-            const xorPattern = new RegExp('\\\\^\\\\s*0x[0-9a-f]+', 'gi');
-            const xorMatches = source.match(xorPattern);
-            if (xorMatches && xorMatches.length > 5) {{
-                results.suspicious_patterns.push('XOR string decryption (' + xorMatches.length + ' XOR operations)');
-            }}
+            }
+            const xorMatches = source.match(/\^\s*0x[0-9a-fA-F]+/g);
+            if (xorMatches && xorMatches.length > 5) {
+                results.suspicious_patterns.push('XOR decryption (' + xorMatches.length + ' ops)');
+            }
+            if (/atob\s*\(/.test(source) && /fromCharCode/.test(source)) {
+                results.suspicious_patterns.push('Base64 + fromCharCode decoder');
+            }
 
             results.api_names = [...new Set(results.api_names)].sort();
             results.decoded_strings = [...new Set(results.decoded_strings)].slice(0, 500);
             results.total_unique_strings = allStrings.size;
 
             return results;
-        }}""")
-        return results
+        }
+        """
+
+        return await page.evaluate(extractor, script_url)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def find_dispatch_loops(
+    script_url: str,
+    min_case_count: int = 20,
+) -> dict:
+    """Scan a JSVMP script for bytecode-dispatch-loop candidates.
+
+    A dispatch loop is a giant while(true) or for(;;) containing a switch
+    with many cases, typical of VMP interpreters. This tool extracts such
+    candidates so you can target them with instrument_jsvmp_source or
+    hook_function.
+
+    Args:
+        script_url: Full URL of the JS file (will be fetched by the browser).
+        min_case_count: Only report switches with at least this many cases.
+
+    Returns:
+        dict with candidates: [{fn_name, case_count, char_range, preview}]
+    """
+    try:
+        page = await browser_manager.get_active_page()
+
+        extractor = r"""
+        async (url, minCaseCount) => {
+            const resp = await fetch(url);
+            const src = await resp.text();
+
+            // Find every `switch(` and count its `case ` occurrences until
+            // matching `}` - naive but works for most minified VMPs.
+            const results = [];
+            const switchRe = /switch\s*\(/g;
+            let m;
+            while ((m = switchRe.exec(src)) !== null) {
+                // Find matching `{` after the switch's `)`
+                let i = m.index + m[0].length;
+                let depth = 1;
+                while (i < src.length && src[i] !== ')') i++;
+                if (i >= src.length) continue;
+                while (i < src.length && src[i] !== '{') i++;
+                if (i >= src.length) continue;
+                const start = i;
+                depth = 1; i++;
+                while (i < src.length && depth > 0) {
+                    if (src[i] === '{') depth++;
+                    else if (src[i] === '}') depth--;
+                    i++;
+                }
+                const end = i;
+                const body = src.slice(start, end);
+                const caseCount = (body.match(/\bcase\s+/g) || []).length;
+                if (caseCount >= minCaseCount) {
+                    // Look backwards for enclosing function name
+                    let back = m.index;
+                    const backSlice = src.slice(Math.max(0, back - 500), back);
+                    const fnMatch = backSlice.match(/function\s+([A-Za-z_$][\w$]*)/);
+                    const fnExprMatch = backSlice.match(/(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*function/);
+                    results.push({
+                        fn_name: (fnMatch && fnMatch[1]) || (fnExprMatch && fnExprMatch[1]) || null,
+                        case_count: caseCount,
+                        char_range: [start, end],
+                        preview: body.slice(0, 200).replace(/\s+/g, ' ')
+                    });
+                }
+            }
+            return { candidates: results, total: results.length,
+                     source_length: src.length };
+        }
+        """
+
+        return await page.evaluate(extractor, [script_url, min_case_count])
     except Exception as e:
         return {"error": str(e)}
 

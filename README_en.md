@@ -151,7 +151,7 @@ python -m camoufox_reverse_mcp \
 
 ---
 
-## Available Tools (57)
+## Available Tools (65)
 
 ### Navigation & Page
 - `launch_browser` — Launch Camoufox (returns full session state if already running)
@@ -186,7 +186,7 @@ python -m camoufox_reverse_mcp \
 - `trace_function` — Trace function calls without pausing (**persistent**, cross-navigation)
 - `get_trace_data` — Get collected trace data (merges page + persistent data)
 - `hook_function` — Inject custom hook code (before/after/replace, **non_overridable**)
-- `inject_hook_preset` — One-click preset hooks (xhr/fetch/crypto/websocket/debugger_bypass, **persistent by default**)
+- `inject_hook_preset` — One-click preset hooks (xhr/fetch/crypto/websocket/debugger_bypass/cookie/runtime_probe, **persistent by default**)
 - `trace_property_access` — Track property access (Proxy-level), reveals JSVMP env reads
 - `get_property_access_log` — Get property access records
 - `remove_hooks` — Remove all hooks (optionally keep persistent ones)
@@ -203,10 +203,25 @@ python -m camoufox_reverse_mcp \
 - `search_json_path` — **[New]** Extract JSON data by dot-notation path (`data[*].id` wildcard)
 
 ### JSVMP Reverse Analysis
-- `hook_jsvmp_interpreter` — Instrument JSVMP interpreter: trace API calls & property reads
+- `hook_jsvmp_interpreter` — **[Enhanced]** Universal JSVMP runtime probe: apply/call/bind + Reflect.* + Proxy property tracking
 - `get_jsvmp_log` — Get JSVMP execution log (with API call stats & property summary)
-- `dump_jsvmp_strings` — Extract JSVMP string table: decode obfuscated strings, find API names
+- `dump_jsvmp_strings` — **[Fixed]** Extract JSVMP string table: manual bracket matching, no more regex hangs
 - `compare_env` — Collect browser env fingerprint for comparison with Node.js/jsdom
+- `find_dispatch_loops` — **[New]** Scan script for bytecode dispatch loop candidates (while+switch)
+
+### JSVMP Source-Level Instrumentation (Universal VMP Weapon)
+- `instrument_jsvmp_source` — **[New]** Rewrite JS source at HTTP layer, tap every obj[key] / fn(args) inside bytecode dispatch loops
+- `get_instrumentation_log` — **[New]** Retrieve source-level instrumentation logs with hot_keys / hot_methods summary
+- `get_instrumentation_status` — **[New]** Show active source-level instrumentations
+- `stop_instrumentation` — **[New]** Stop one or all source instrumentations
+
+### Cookie Attribution
+- `analyze_cookie_sources` — **[New]** Attribute each cookie to HTTP Set-Cookie or JS document.cookie
+
+### Navigation Enhancements
+- `navigate` — **[Enhanced]** pre_inject_hooks, initial_status + final_status + redirect_chain
+- `reload_with_hooks` — **[New]** Reload page so persistent hooks run before page JS
+- `get_runtime_probe_log` — **[New]** Retrieve runtime_probe.js broad-spectrum events
 
 ### Storage Management
 - `get_cookies` / `set_cookies` / `delete_cookies` — Cookie management
@@ -303,9 +318,54 @@ AI workflow:
 9. get_page_content()                             ← Export rendered HTML + visible text
 ```
 
+### Scenario 6: Universal JSVMP Reverse Engineering (Rui Shu 6 / Akamai / Custom VMP)
+
+The recommended JSVMP analysis workflow — works on virtually all VMP types.
+
+```
+AI workflow:
+1. launch_browser(headless=False)
+2. start_network_capture(capture_body=True)
+3. navigate("https://target.com/")           ← First visit to locate VMP script
+4. list_network_requests(resource_type="script")
+5. find_dispatch_loops(script_url="https://target.com/sdenv-xxx.js")
+6. instrument_jsvmp_source("**/sdenv-*.js", mode="ast", tag="vmp1")
+7. inject_hook_preset("cookie", persistent=True)
+8. inject_hook_preset("xhr", persistent=True)
+9. reload_with_hooks()                       ← Re-run with instrumentation hot
+10. get_instrumentation_log(tag_filter="vmp1", type_filter="tap_get", limit=100)
+11. get_instrumentation_log(tag_filter="vmp1", type_filter="tap_method")
+12. analyze_cookie_sources()
+13. Reconstruct algorithm from instrumentation data
+```
+
 ---
 
 ## Changelog
+
+### v0.4.0 (2026-04-17) — Universal JSVMP Adaptation
+
+> Make this MCP a universal JSVMP reverse engineering weapon. Add source-level instrumentation, cookie attribution, runtime probe. Fix jsvmp_hook multi-path coverage and dump_jsvmp_strings regex. Tools: 57 → 65.
+
+**New Tools (8)**
+| Tool | Description |
+|------|-------------|
+| `instrument_jsvmp_source` | Source-level instrumentation: rewrite JS before execution, tap every obj[key] / fn(args) |
+| `get_instrumentation_log` | Retrieve source-level instrumentation logs with hot_keys / hot_methods summary |
+| `get_instrumentation_status` | Show active source-level instrumentations |
+| `stop_instrumentation` | Stop one or all source instrumentations |
+| `find_dispatch_loops` | Scan script for bytecode dispatch loop candidates |
+| `reload_with_hooks` | Reload page so persistent hooks run before page JS |
+| `analyze_cookie_sources` | Attribute each cookie to HTTP Set-Cookie or JS document.cookie |
+| `get_runtime_probe_log` | Retrieve runtime_probe.js broad-spectrum events |
+
+**Major Improvements**
+- **hook_jsvmp_interpreter rewrite**: Multi-path coverage (apply/call/bind + Reflect.* + Proxy + timing APIs)
+- **navigate enhanced**: pre_inject_hooks, initial_status + final_status + redirect_chain
+- **dump_jsvmp_strings fixed**: Manual bracket matching replaces nested regex
+- **New cookie_hook.js**: Prototype-chain level document.cookie hook
+- **New runtime_probe.js**: Low-overhead universal runtime observer
+- **inject_hook_preset new presets**: `cookie`, `runtime_probe`
 
 ### v0.3.0 (2026-04-03) — Stability Fixes + Response Search + DOM Export + Session Management
 

@@ -52,6 +52,8 @@ class BrowserManager:
         self._init_scripts: list[str] = []
         self._persistent_scripts: list[dict] = []
         self._persistent_traces: dict[str, list] = {}
+        self._nav_responses: list[dict] = []  # 最近一次 navigate 记录到的响应链路
+        self._route_handlers: dict[str, Any] = {}  # 已注册的 route handler 映射
 
     async def launch(self, config: dict | None = None) -> dict:
         """Launch the Camoufox browser with the given or default config."""
@@ -155,6 +157,7 @@ class BrowserManager:
         page.on("console", self._on_console)
         page.on("request", self._on_request)
         page.on("response", self._on_response_async)
+        page.on("response", self._on_response_for_nav)
 
     def _on_console(self, msg) -> None:
         text = msg.text
@@ -227,6 +230,24 @@ class BrowserManager:
         except Exception:
             entry["response_body"] = None
 
+    def _on_response_for_nav(self, resp) -> None:
+        """Record every response during a navigation for final_status resolution."""
+        try:
+            self._nav_responses.append({
+                "url": resp.url,
+                "status": resp.status,
+                "resource_type": getattr(resp.request, "resource_type", None) if resp.request else None,
+                "ts": int(time.time() * 1000),
+            })
+            # Keep only the last 100
+            if len(self._nav_responses) > 100:
+                self._nav_responses = self._nav_responses[-100:]
+        except Exception:
+            pass
+
+    def reset_nav_responses(self) -> None:
+        self._nav_responses = []
+
     async def create_context(self, name: str, cookies: list[dict] | None = None) -> dict:
         """Create a new isolated browser context with optional cookies."""
         await self._ensure_browser()
@@ -269,4 +290,6 @@ class BrowserManager:
         self._init_scripts.clear()
         self._persistent_scripts.clear()
         self._persistent_traces.clear()
+        self._nav_responses.clear()
+        self._route_handlers.clear()
         return {"status": "closed"}

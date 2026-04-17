@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import json as _json
+import os
 
 from ..server import mcp, browser_manager
 
@@ -68,27 +70,153 @@ async def close_browser() -> dict:
 
 
 @mcp.tool()
-async def navigate(url: str, wait_until: str = "load") -> dict:
-    """Navigate to the specified URL.
+async def navigate(
+    url: str,
+    wait_until: str = "load",
+    pre_inject_hooks: list[str] | None = None,
+    via_blank: bool = False,
+    collect_response_chain: bool = True,
+) -> dict:
+    """Navigate to a URL, with optional hook pre-injection and redirect tracing.
+
+    For sites that detect/challenge on the very first request (Rui Shu,
+    Akamai, etc.), normal `navigate` misses the initial JS because probes
+    inject AFTER the page loads. Use `pre_inject_hooks` to guarantee hooks
+    are installed before ANY target-site JS runs.
 
     Args:
-        url: Target URL to navigate to.
-        wait_until: When to consider navigation complete -
-            "load", "domcontentloaded", or "networkidle".
+        url: Target URL.
+        wait_until: "load", "domcontentloaded", or "networkidle".
+        pre_inject_hooks: Optional list of hook preset names to inject BEFORE
+            navigation begins. Accepts any preset from inject_hook_preset
+            ("xhr", "fetch", "crypto", "websocket", "debugger_bypass") and
+            also the special names:
+                - "jsvmp_probe"       - default jsvmp_hook.js probe
+                - "cookie_hook"       - document.cookie prototype hook
+                - "runtime_probe"     - full runtime_probe.js
+            This routes through about:blank first, evaluates all hooks there,
+            then navigates to the target URL - guaranteeing hooks are hot
+            when the target page's first <script> executes.
+        via_blank: If True, always go via about:blank first (even without
+            pre_inject_hooks). Useful to ensure persistent scripts from
+            previous sessions are applied.
+        collect_response_chain: If True (default), record every response
+            during this navigation so final_status reflects JS-driven
+            redirects (Rui Shu 412 -> 200 after cookie challenge).
 
     Returns:
-        dict with url, title, and HTTP status.
+        dict with:
+            url: Final URL after all redirects
+            title: Page title
+            initial_status: First HTTP response status (what page.goto saw)
+            final_status: Last response status on the main frame
+                          (None if no main frame response observed)
+            redirect_chain: List of {url, status, ts} for every response
+                            (only populated if collect_response_chain=True)
+            hooks_injected: List of hook names actually injected
+            warnings: Non-fatal issues (failed hook injection, etc.)
     """
     try:
         page = await browser_manager.get_active_page()
+        warnings: list[str] = []
+        hooks_injected: list[str] = []
+
+        # Reset response chain for this navigation
+        if collect_response_chain:
+            browser_manager.reset_nav_responses()
+
+        # Pre-inject via about:blank
+        needs_blank = bool(pre_inject_hooks) or via_blank
+        if needs_blank:
+            try:
+                await page.goto("about:blank", wait_until="domcontentloaded")
+            except Exception as e:
+                warnings.append(f"about:blank navigation failed: {e}")
+
+            if pre_inject_hooks:
+                for name in pre_inject_hooks:
+                    ok, msg = await _inject_hook_by_name(name)
+                    if ok:
+                        hooks_injected.append(name)
+                    else:
+                        warnings.append(f"pre-inject '{name}' failed: {msg}")
+
+        # Main navigation
         resp = await page.goto(url, wait_until=wait_until)
+        initial_status = resp.status if resp else None
+
+        # Find final status on main frame
+        final_status = None
+        chain = []
+        if collect_response_chain:
+            chain = list(browser_manager._nav_responses)
+            # Main-frame candidates: url matches current page.url or was document
+            for r in reversed(chain):
+                if r["url"] == page.url or r.get("resource_type") == "document":
+                    final_status = r["status"]
+                    break
+
         return {
             "url": page.url,
             "title": await page.title(),
-            "status": resp.status if resp else None,
+            "initial_status": initial_status,
+            "final_status": final_status if final_status is not None else initial_status,
+            "redirect_chain": chain if collect_response_chain else None,
+            "hooks_injected": hooks_injected,
+            "warnings": warnings if warnings else None,
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+async def _inject_hook_by_name(name: str) -> tuple[bool, str]:
+    """Dispatch pre-inject hooks by symbolic name. Returns (ok, msg)."""
+    hooks_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks")
+
+    preset_files = {
+        "xhr": "xhr_hook.js",
+        "fetch": "fetch_hook.js",
+        "crypto": "crypto_hook.js",
+        "websocket": "websocket_hook.js",
+        "debugger_bypass": "debugger_trap.js",
+        "cookie_hook": "cookie_hook.js",
+        "runtime_probe": "runtime_probe.js",
+    }
+
+    try:
+        page = await browser_manager.get_active_page()
+
+        if name == "jsvmp_probe":
+            # Use default jsvmp probe with empty script_url (all scripts)
+            with open(os.path.join(hooks_dir, "jsvmp_hook.js"), "r", encoding="utf-8") as f:
+                tpl = f.read()
+            default_proxy = ["navigator", "screen", "history", "localStorage",
+                             "sessionStorage", "performance"]
+            js = (tpl
+                .replace("{{SCRIPT_URL}}", "")
+                .replace("{{MAX_ENTRIES}}", "10000")
+                .replace("{{TRACK_CALLS}}", "true")
+                .replace("{{TRACK_PROPS}}", "true")
+                .replace("{{TRACK_REFLECT}}", "true")
+                .replace("'{{PROXY_OBJECTS}}'", _json.dumps(_json.dumps(default_proxy)))
+            )
+            await browser_manager.add_persistent_script("pre_inject:jsvmp_probe", js)
+            await page.evaluate(js)
+            return True, "ok"
+
+        if name in preset_files:
+            fpath = os.path.join(hooks_dir, preset_files[name])
+            if not os.path.exists(fpath):
+                return False, f"hook file not found: {preset_files[name]}"
+            with open(fpath, "r", encoding="utf-8") as f:
+                js = f.read()
+            await browser_manager.add_persistent_script(f"pre_inject:{name}", js)
+            await page.evaluate(js)
+            return True, "ok"
+
+        return False, f"unknown hook name: {name}"
+    except Exception as e:
+        return False, str(e)
 
 
 @mcp.tool()
@@ -390,6 +518,59 @@ async def get_session_info() -> dict:
             "persistent_scripts": persistent,
             "init_scripts_count": len(browser_manager._init_scripts),
             "console_log_count": len(browser_manager._console_logs),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def reload_with_hooks(
+    clear_log: bool = True,
+    wait_until: str = "load",
+) -> dict:
+    """Reload the current page so that persistent hooks run BEFORE page JS.
+
+    Common use case: you navigate to a page, THEN install jsvmp probe, then
+    want to re-trigger the VMP with probe hot. This is the canonical way -
+    it uses context-level add_init_script (which survives reload) AND clears
+    the log so you get a clean capture from the re-run.
+
+    Args:
+        clear_log: Clear window.__mcp_jsvmp_log and window.__mcp_prop_access_log
+            before reload (default True).
+        wait_until: load / domcontentloaded / networkidle.
+
+    Returns:
+        dict with url, title, final_status, response_chain.
+    """
+    try:
+        page = await browser_manager.get_active_page()
+        if clear_log:
+            try:
+                await page.evaluate("""() => {
+                    if (window.__mcp_jsvmp_log) window.__mcp_jsvmp_log.length = 0;
+                    if (window.__mcp_prop_access_log) window.__mcp_prop_access_log.length = 0;
+                    if (window.__mcp_cookie_log) window.__mcp_cookie_log.length = 0;
+                }""")
+            except Exception:
+                pass
+
+        browser_manager.reset_nav_responses()
+        resp = await page.reload(wait_until=wait_until)
+
+        chain = list(browser_manager._nav_responses)
+        final_status = None
+        for r in reversed(chain):
+            if r["url"] == page.url or r.get("resource_type") == "document":
+                final_status = r["status"]
+                break
+
+        return {
+            "url": page.url,
+            "title": await page.title(),
+            "initial_status": resp.status if resp else None,
+            "final_status": final_status if final_status is not None else (resp.status if resp else None),
+            "redirect_chain": chain,
         }
     except Exception as e:
         return {"error": str(e)}
