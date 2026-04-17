@@ -105,6 +105,16 @@ async def navigate(
                 - "runtime_probe"     - full runtime_probe.js
             Hooks are registered at context level, then the page is navigated
             and automatically reloaded so hooks are active from the start.
+
+            WARNING: pre-injected probes modify the runtime environment
+            (Proxy on navigator/screen, Function.prototype.apply/call
+            overrides). For signature-based anti-bot systems where the
+            environment fingerprint feeds into a hash (Rui Shu sdenv,
+            Akamai sensor_data), this WILL cause the challenge to fail.
+            Symptoms: navigate never completes, redirect_chain shows
+            repeated 412 responses with no 200. For those sites, use
+            instrument_jsvmp_source() instead — it rewrites the JS source
+            without touching the environment.
         collect_response_chain: If True (default), record every response
             during this navigation so final_status reflects JS-driven
             redirects (Rui Shu 412 -> 200 after cookie challenge).
@@ -217,6 +227,17 @@ async def _inject_hook_by_name(name: str) -> tuple[bool, str]:
                 .replace("'{{PROXY_OBJECTS}}'", _json.dumps(_json.dumps(default_proxy)))
             )
             persist_name = "pre_inject:jsvmp_probe"
+        elif name == "jsvmp_probe_transparent":
+            hook_path = os.path.join(hooks_dir, "jsvmp_transparent_hook.js")
+            if not os.path.exists(hook_path):
+                return False, "jsvmp_transparent_hook.js not found"
+            with open(hook_path, "r", encoding="utf-8") as f:
+                tpl = f.read()
+            js = (tpl
+                .replace("{{SCRIPT_URL}}", "")
+                .replace("{{MAX_ENTRIES}}", "10000")
+            )
+            persist_name = "pre_inject:jsvmp_probe_transparent"
         elif name in preset_files:
             fpath = os.path.join(hooks_dir, preset_files[name])
             if not os.path.exists(fpath):

@@ -215,6 +215,18 @@ python -m camoufox_reverse_mcp \
 | `search_json_path` | **[新]** 按 JSON 路径提取响应数据（支持 `data[*].id` 通配） |
 
 ### JSVMP 逆向分析（新增模块）
+
+> **反爬类型 → 工具路径对照表**
+>
+> 不同类型的反爬要用不同的工具，用错会导致挑战永远过不去。先识别类型再选工具。
+>
+> | 反爬类型 | 代表 | ✅ 推荐路径 | ❌ 禁用 |
+> |---|---|---|---|
+> | **签名型**（环境即签名） | 瑞数 5/6、Akamai sensor_data v3+、Shape Security | `instrument_jsvmp_source(mode="ast")` + `analyze_cookie_sources()` | `pre_inject_hooks`、`hook_jsvmp_interpreter(mode="proxy")` |
+> | **行为型**（参数签名） | TikTok webmssdk、极验 gt4 | `hook_jsvmp_interpreter(mode="proxy")` 全量开 | — |
+> | **纯混淆** | obfuscator.io、自研 VMP 无反指纹 | 任意组合 | — |
+>
+> **识别方法**：先 `navigate()`（不加 pre_inject），看 `redirect_chain`。出现重复 412 或 302 循环 → 签名型，走源码插桩。
 | 工具 | 说明 |
 |------|------|
 | `hook_jsvmp_interpreter` | **[增强]** 通用 JSVMP 运行时探针：覆盖 apply/call/bind + Reflect.* + Proxy 属性追踪 |
@@ -373,6 +385,8 @@ AI 操作链：
 13. # 根据插桩数据在 Node.js / jsdom 侧补齐环境差异，跑通算法
 ```
 
+> 👉 完整的反爬类型识别与工作流见 [docs/JSVMP_PLAYBOOK.md](docs/JSVMP_PLAYBOOK.md)
+
 ---
 
 ## 技术架构
@@ -400,6 +414,31 @@ AI 操作链：
 ```
 
 ## 更新记录
+
+### v0.5.0（2026-04-18）— 签名型反爬兼容改造
+
+> 解决 `pre_inject_hooks` 对瑞数/Akamai 签名型反爬不可用的架构性问题。新增 MCP 侧 AST 改写、transparent 观察模式、反爬类型决策表和实战 Playbook。
+
+**架构性改进**
+- **`instrument_jsvmp_source` 默认改为 MCP 侧 esprima AST 改写**：不再依赖页面内 CDN（挑战页加载不到），AST 失败自动回落 regex
+- **`hook_jsvmp_interpreter` 新增 `mode="transparent"`**：只替换原型 getter，不装 Proxy、不动 Function.prototype，签名型反爬可用
+- **反爬类型决策表**：签名型/行为型/纯混淆各自推荐工具路径，避免用错工具导致挑战永远过不去
+- **JSVMP Playbook**：按反爬类型给出完整工作流（`docs/JSVMP_PLAYBOOK.md`）
+
+**新增文件**
+- `hooks/jsvmp_transparent_hook.js` — 签名安全的运行时观察器
+- `utils/ast_rewriter.py` — MCP 侧 esprima AST 改写器
+- `docs/JSVMP_PLAYBOOK.md` — 反爬类型识别与工作流指南
+- `tests/test_ast_rewriter.py` — AST 改写器单元测试
+
+**文档诚实度修正**
+- `hook_jsvmp_interpreter` docstring 加 LIMITATIONS 段，明确签名型反爬不可用
+- `navigate` 的 `pre_inject_hooks` 参数加 WARNING，说明症状和替代方案
+- `instrument_jsvmp_source` docstring 标注为签名型反爬首选
+- README 工具列表前插入反爬类型→工具路径对照表
+
+**新增依赖**
+- `esprima>=4.0.1`（纯 Python，零 C 扩展）
 
 ### v0.4.0（2026-04-17）— 通用 JSVMP 适配改造
 

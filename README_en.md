@@ -203,6 +203,18 @@ python -m camoufox_reverse_mcp \
 - `search_json_path` — **[New]** Extract JSON data by dot-notation path (`data[*].id` wildcard)
 
 ### JSVMP Reverse Analysis
+
+> **Anti-Bot Type → Tool Path Decision Table**
+>
+> Different anti-bot types require different tools. Using the wrong one causes the challenge to never pass.
+>
+> | Anti-Bot Type | Examples | ✅ Recommended | ❌ Do NOT Use |
+> |---|---|---|---|
+> | **Signature-based** (env = signature) | Rui Shu 5/6, Akamai sensor_data v3+, Shape Security | `instrument_jsvmp_source(mode="ast")` + `analyze_cookie_sources()` | `pre_inject_hooks`, `hook_jsvmp_interpreter(mode="proxy")` |
+> | **Behavior-based** (param signature) | TikTok webmssdk, GeeTest gt4 | `hook_jsvmp_interpreter(mode="proxy")` full coverage | — |
+> | **Pure obfuscation** | obfuscator.io, custom VMP without fingerprinting | Any combination | — |
+>
+> **How to identify**: `navigate()` without pre_inject, check `redirect_chain`. Repeated 412 or 302 loops → signature-based, use source instrumentation.
 - `hook_jsvmp_interpreter` — **[Enhanced]** Universal JSVMP runtime probe: apply/call/bind + Reflect.* + Proxy property tracking
 - `get_jsvmp_log` — Get JSVMP execution log (with API call stats & property summary)
 - `dump_jsvmp_strings` — **[Fixed]** Extract JSVMP string table: manual bracket matching, no more regex hangs
@@ -339,9 +351,26 @@ AI workflow:
 13. Reconstruct algorithm from instrumentation data
 ```
 
+> 👉 Full anti-bot type identification and workflow guide: [docs/JSVMP_PLAYBOOK.md](docs/JSVMP_PLAYBOOK.md)
+
 ---
 
 ## Changelog
+
+### v0.5.0 (2026-04-18) — Signature-Based Anti-Bot Compatibility
+
+> Fix the architectural issue where `pre_inject_hooks` breaks signature-based anti-bot (Rui Shu/Akamai). Add MCP-side AST rewriting, transparent observation mode, anti-bot type decision table, and JSVMP Playbook.
+
+**Architectural Improvements**
+- **`instrument_jsvmp_source` default changed to MCP-side esprima AST**: No CDN dependency, auto-fallback to regex on parse failure
+- **`hook_jsvmp_interpreter` new `mode="transparent"`**: Prototype-getter replacement only, no Proxy, no Function.prototype changes
+- **Anti-bot type decision table**: Signature/behavior/obfuscation types with recommended tool paths
+- **JSVMP Playbook**: Per-anti-bot-type workflow guide (`docs/JSVMP_PLAYBOOK.md`)
+
+**New Files**
+- `hooks/jsvmp_transparent_hook.js`, `utils/ast_rewriter.py`, `docs/JSVMP_PLAYBOOK.md`, `tests/test_ast_rewriter.py`
+
+**New Dependency**: `esprima>=4.0.1` (pure Python)
 
 ### v0.4.0 (2026-04-17) — Universal JSVMP Adaptation
 

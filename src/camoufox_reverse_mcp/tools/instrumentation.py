@@ -19,6 +19,7 @@ from ..utils.js_rewriter import (
     INSTRUMENT_RUNTIME,
     ACORN_REWRITE_JS_TEMPLATE,
 )
+from ..utils.ast_rewriter import ast_rewrite as _ast_rewrite_py
 
 
 # Module-level state for active instrumentation routes
@@ -28,39 +29,50 @@ _active_routes: dict[str, dict] = {}
 @mcp.tool()
 async def instrument_jsvmp_source(
     url_pattern: str,
-    mode: str = "regex",
+    mode: str = "ast",
     tag: str = "vmp",
     rewrite_member_access: bool = True,
     rewrite_calls: bool = True,
-    max_rewrites: int = 5000,
+    max_rewrites: int = 20000,
     cache_rewritten: bool = True,
+    fallback_on_error: bool = True,
 ) -> dict:
     """Intercept a JSVMP script and instrument its source at the HTTP layer.
 
-    This is the most powerful technique for analyzing JSVMP-protected scripts.
-    Unlike runtime hooks that only see what the VMP routes through hookable
-    APIs, source-level instrumentation inserts taps at EVERY member access
-    and function call - including inside the bytecode dispatch loop's
-    switch(opcode) { ... } cases.
+    ★ RECOMMENDED DEFAULT for signature-based anti-bot (Rui Shu, Akamai,
+    Shape Security). Unlike runtime hooks, this tool rewrites the JS source
+    before the browser executes it. The environment stays pristine — the
+    VMP reads the real navigator, computes the real signature, and the
+    server accepts it. Meanwhile every internal operation of the VMP is
+    logged through the injected taps.
 
-    After this tool succeeds, subsequent loads of url_pattern return rewritten
-    source. The VMP still runs normally but every internal operation is
-    logged to window.__mcp_vmp_log. Use get_instrumentation_log to retrieve.
+    This is the only observation technique compatible with cookie/signature
+    schemes that hash environment properties.
 
     Args:
         url_pattern: Glob pattern matching the VMP script URL(s), e.g.:
             "**/webmssdk.es5.js"
             "**/FuckCookie_*.js"
             "https://target.com/sdenv-*.js"
-        mode: "regex" (fast, ~80% coverage, no CDN) or "ast"
-            (precise, loads acorn from CDN into the page).
-        tag: String tag attached to every log entry (for filtering when
-            instrumenting multiple scripts).
+        mode: One of:
+            - "ast"       — (default) AST rewrite via MCP-side esprima.
+                            Zero page-side dependencies, works on 412 pages
+                            that block external CDNs.
+            - "regex"     — Faster, no AST parse; ~80% coverage, good for
+                            minified code. Used as automatic fallback when
+                            AST fails and fallback_on_error=True.
+            - "ast_page"  — DEPRECATED. v0.4.x behavior: loads Acorn from
+                            a CDN into the target page. Breaks on challenge
+                            pages that block CDNs. Kept only for A/B
+                            comparison.
+        tag: String tag attached to every log entry.
         rewrite_member_access: Tap every obj[key] / obj.key read.
         rewrite_calls: Tap every fn(args) / obj.method(args) call.
         max_rewrites: Hard cap on rewrites per file (safety).
-        cache_rewritten: Cache the rewritten source so repeated fetches
-            don't re-run the rewriter (recommended True).
+        cache_rewritten: Cache the rewritten source.
+        fallback_on_error: If mode="ast" and AST parse fails, automatically
+            retry with regex mode instead of shipping unmodified source
+            (default True).
 
     Returns:
         dict with status and pattern. The actual rewrite happens when the
@@ -69,12 +81,12 @@ async def instrument_jsvmp_source(
     try:
         page = await browser_manager.get_active_page()
         cache: dict[str, str] = {}
-        stats = {"files_rewritten": 0, "total_edits": 0, "last_url": None}
+        stats = {"files_rewritten": 0, "total_edits": 0, "last_url": None,
+                 "last_mode_used": None}
 
         async def route_handler(route):
             try:
                 req_url = route.request.url
-                # Try cache first
                 if cache_rewritten and req_url in cache:
                     await route.fulfill(
                         status=200,
@@ -84,7 +96,7 @@ async def instrument_jsvmp_source(
                     return
 
                 resp = await route.fetch()
-                status = resp.status
+                resp_status = resp.status
                 body_bytes = await resp.body()
                 try:
                     src = body_bytes.decode("utf-8")
@@ -93,35 +105,73 @@ async def instrument_jsvmp_source(
 
                 rewritten = src
                 edit_count = 0
-                if mode == "regex":
-                    rewritten, rstats = regex_rewrite(
+                mode_used = mode
+
+                if mode == "ast":
+                    # MCP-side esprima
+                    ast_out, ast_stats = _ast_rewrite_py(
+                        src, tag=tag,
+                        rewrite_member_access=rewrite_member_access,
+                        rewrite_calls=rewrite_calls,
+                        max_edits=max_rewrites,
+                    )
+                    if ast_out is not None:
+                        rewritten = ast_out
+                        edit_count = ast_stats.get("edits", 0)
+                    elif fallback_on_error:
+                        browser_manager._console_logs.append({
+                            "level": "warn",
+                            "text": f"[INSTRUMENT] AST parse failed for {req_url}: "
+                                    f"{ast_stats.get('error')}. Falling back to regex.",
+                            "timestamp": int(time.time() * 1000),
+                            "location": None,
+                        })
+                        mode_used = "regex (fallback)"
+                        rw, rstats = regex_rewrite(
+                            src, tag=tag,
+                            rewrite_member_access=rewrite_member_access,
+                            max_rewrites=max_rewrites,
+                        )
+                        rewritten = rw
+                        edit_count = rstats.get("member_access_rewrites", 0)
+                    else:
+                        rewritten = src
+
+                elif mode == "regex":
+                    rw, rstats = regex_rewrite(
                         src, tag=tag,
                         rewrite_member_access=rewrite_member_access,
                         max_rewrites=max_rewrites,
                     )
+                    rewritten = rw
                     edit_count = rstats.get("member_access_rewrites", 0)
-                elif mode == "ast":
+
+                elif mode == "ast_page":
+                    # DEPRECATED: v0.4.x behavior, kept for A/B comparison
                     opts = {
                         "rewriteMemberAccess": rewrite_member_access,
                         "rewriteCalls": rewrite_calls,
                     }
-                    result = await page.evaluate(
-                        ACORN_REWRITE_JS_TEMPLATE,
-                        [src, tag, opts]
-                    )
-                    if result.get("ok"):
-                        rewritten = INSTRUMENT_RUNTIME + "\n" + result["src"]
-                        edit_count = result.get("edit_count", 0)
-                    else:
-                        rewritten = src  # AST failed, pass through unchanged
+                    try:
+                        result = await page.evaluate(
+                            ACORN_REWRITE_JS_TEMPLATE,
+                            [src, tag, opts]
+                        )
+                        if result.get("ok"):
+                            rewritten = INSTRUMENT_RUNTIME + "\n" + result["src"]
+                            edit_count = result.get("edit_count", 0)
+                        else:
+                            rewritten = src
+                    except Exception as e:
+                        rewritten = src
                         browser_manager._console_logs.append({
-                            "level": "warn",
-                            "text": f"[INSTRUMENT] AST rewrite failed for {req_url}: {result.get('error')}",
+                            "level": "error",
+                            "text": f"[INSTRUMENT] ast_page threw for {req_url}: {e}",
                             "timestamp": int(time.time() * 1000),
                             "location": None,
                         })
                 else:
-                    rewritten = src  # unknown mode; safety no-op
+                    rewritten = src
 
                 if cache_rewritten:
                     cache[req_url] = rewritten
@@ -129,21 +179,22 @@ async def instrument_jsvmp_source(
                 stats["files_rewritten"] += 1
                 stats["total_edits"] += edit_count
                 stats["last_url"] = req_url
+                stats["last_mode_used"] = mode_used
 
-                # Preserve original headers (minus content-length which we're changing)
                 headers = dict(resp.headers)
                 headers.pop("content-length", None)
                 headers.pop("Content-Length", None)
                 headers["content-type"] = "application/javascript; charset=utf-8"
 
                 await route.fulfill(
-                    status=status,
+                    status=resp_status,
                     headers=headers,
                     body=rewritten,
                 )
                 browser_manager._console_logs.append({
                     "level": "info",
-                    "text": f"[INSTRUMENT] rewrote {req_url} ({edit_count} edits, mode={mode})",
+                    "text": f"[INSTRUMENT] rewrote {req_url} "
+                            f"({edit_count} edits, mode={mode_used})",
                     "timestamp": int(time.time() * 1000),
                     "location": None,
                 })
@@ -193,6 +244,7 @@ async def get_instrumentation_status() -> dict:
                     "files_rewritten": info["stats"]["files_rewritten"],
                     "total_edits": info["stats"]["total_edits"],
                     "last_url": info["stats"]["last_url"],
+                    "last_mode_used": info["stats"].get("last_mode_used"),
                     "cached_urls": len(info["cache"]),
                 }
                 for pat, info in _active_routes.items()
@@ -270,7 +322,6 @@ async def get_instrumentation_log(
                     or key_filter in (d.get("method") or "")
                     or key_filter in (d.get("name") or "")]
 
-        # Summary: hottest keys accessed, hottest methods called
         key_count: dict[str, int] = {}
         method_count: dict[str, int] = {}
         fn_count: dict[str, int] = {}
