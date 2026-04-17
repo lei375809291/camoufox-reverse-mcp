@@ -204,6 +204,70 @@ def test_new_tools_registered():
     assert not missing, f"Missing tools: {missing}"
 
 
+# ============ pre_inject timeout protection ============
+
+@pytest.mark.asyncio
+async def test_pre_inject_eval_timeout_does_not_hang():
+    """_inject_hook_by_name must not hang if page.evaluate blocks forever.
+
+    Regression: navigate(pre_inject_hooks=[...]) hung in v0.4.0 when evaluate
+    on about:blank wedged (e.g. cookie_hook descriptor walk on opaque origin,
+    jsvmp_probe Proxy install). Fix: asyncio.wait_for + JS try/catch +
+    fall-through to persistent registration being authoritative.
+    """
+    import asyncio
+    from unittest.mock import patch
+    from camoufox_reverse_mcp.tools import navigation
+
+    register_calls = []
+
+    async def _noop_register(name, content):
+        register_calls.append(name)
+
+    class _HangingPage:
+        async def evaluate(self, _js):
+            await asyncio.Event().wait()
+
+    async def _get_page():
+        return _HangingPage()
+
+    with patch.object(navigation, "_PRE_INJECT_EVAL_TIMEOUT", 0.1), \
+         patch.object(navigation.browser_manager, "add_persistent_script", _noop_register), \
+         patch.object(navigation.browser_manager, "get_active_page", _get_page):
+        ok, msg = await asyncio.wait_for(
+            navigation._inject_hook_by_name("cookie_hook"), timeout=2.0
+        )
+
+    assert ok is True, f"should succeed via persistent registration, got msg={msg}"
+    assert "timed out" in msg.lower()
+    assert register_calls == ["pre_inject:cookie_hook"]
+
+
+@pytest.mark.asyncio
+async def test_pre_inject_js_exception_does_not_fail_registration():
+    """If the hook JS throws on about:blank, persistent registration still wins."""
+    import asyncio
+    from unittest.mock import patch
+    from camoufox_reverse_mcp.tools import navigation
+
+    async def _noop_register(name, content):
+        pass
+
+    class _ThrowingPage:
+        async def evaluate(self, _js):
+            raise RuntimeError("evaluate boom")
+
+    async def _get_page():
+        return _ThrowingPage()
+
+    with patch.object(navigation.browser_manager, "add_persistent_script", _noop_register), \
+         patch.object(navigation.browser_manager, "get_active_page", _get_page):
+        ok, msg = await navigation._inject_hook_by_name("jsvmp_probe")
+
+    assert ok is True
+    assert "evaluate boom" in msg or "error" in msg.lower()
+
+
 # ============ Version ============
 
 def test_version_is_040():

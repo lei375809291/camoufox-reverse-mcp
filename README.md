@@ -487,6 +487,18 @@ AI 操作链：
 - 存储：Cookie / Storage / 状态导入导出（7 个工具）
 - 指纹：指纹检查 / 检测测试 / 反调试绕过（3 个工具）
 
+## 反馈 / 交流
+
+使用过程中遇到 bug、想要新的 Hook 预设、或者想交流 JS 逆向思路，欢迎加微信：
+
+- **微信号**：`han8888v8888`
+
+<p align="left">
+  <img src="assets/wechat_qr.png" alt="WeChat QR" width="220" />
+</p>
+
+> 加好友时烦请备注「camoufox-reverse」，方便快速通过。
+
 ## 许可证
 
 MIT
