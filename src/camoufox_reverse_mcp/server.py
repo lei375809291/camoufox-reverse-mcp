@@ -13,3 +13,5 @@ browser_manager = BrowserManager()
 
 from .tools import navigation, script_analysis, debugging, hooking, network, storage, fingerprint, jsvmp  # noqa: E402, F401
 from .tools import cookie_analysis, instrumentation  # noqa: E402, F401
+from .tools import session  # noqa: E402, F401
+from .tools import assertions  # noqa: E402, F401

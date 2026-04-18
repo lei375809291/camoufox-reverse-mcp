@@ -183,7 +183,7 @@ def test_all_65_tools_registered():
     from camoufox_reverse_mcp.server import mcp
     tools = mcp._tool_manager.list_tools()
     tool_names = [t.name for t in tools]
-    assert len(tools) == 65, f"Expected 65 tools, got {len(tools)}: {tool_names}"
+    assert len(tools) == 78, f"Expected 78 tools, got {len(tools)}: {tool_names}"
 
 
 def test_new_tools_registered():
@@ -271,4 +271,4 @@ async def test_pre_inject_jsvmp_probe_registers():
 
 def test_version_is_040():
     from camoufox_reverse_mcp import __version__
-    assert __version__ == "0.6.0"
+    assert __version__ == "0.8.0"

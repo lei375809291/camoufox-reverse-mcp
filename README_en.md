@@ -357,6 +357,19 @@ AI workflow:
 
 ## Changelog
 
+### v0.8.0 (2026-04-18) — Domain Session Archives + Run Layering + Assertion Reverify
+
+> Persist sessions by eTLD+1 domain, share assertions and samples across conversations. 13 new tools, total 65 → 78. Skipped v0.7.0 (original design rejected).
+
+**Added**
+- Domain-keyed session archive system (`~/.camoufox-reverse/sessions/<domain>/`)
+- Coarse-grained assertions (domain-level persistent, cross-run)
+- `reverify_all_assertions_on_domain` — site upgrade triage tool
+- `verify_against_session` — offline signing code verifier with char-level diff
+- Auto-archive tool calls and network events to active run
+
+**New Dependency**: `tldextract >= 3.4.0`
+
 ### v0.6.0 (2026-04-18) — Bug Fixes + Usability
 
 > Pure bug fix + usability improvements. No new tools. Tool count stays at 65.
