@@ -415,6 +415,21 @@ AI 操作链：
 
 ## 更新记录
 
+### v0.8.0（2026-04-18）— 域级 Session 档案 + Run 分层 + 断言批量 Reverify
+
+> 按 eTLD+1 域名持久化 session，跨对话、跨日期共享断言与样本池。新增 13 个工具，总数 65 → 78。跳过 v0.7.0（原设计被否决）。
+
+**新增**
+- **域级 session 档案系统**：`~/.camoufox-reverse/sessions/<domain>/`
+  - `start_reverse_session` / `stop_reverse_session` / `get_session_snapshot` / `list_sessions` / `attach_domain_readonly` / `export_session` / `import_session`
+- **粗粒度断言**（域级持久，跨 run）
+  - `add_assertion` / `verify_assertion` / `list_assertions` / `remove_assertion`
+- **`reverify_all_assertions_on_domain`** — 站点升级分诊器：批量重跑本域所有断言，返回 passed/failed/errored + 可读 interpretation
+- **`verify_against_session`** — 离线协议代码验证器：从历史网络样本重放，字符级首偏差点定位
+- 所有工具调用、网络事件**自动归档**到当前 active run
+
+**新增依赖**：`tldextract >= 3.4.0`
+
 ### v0.6.0（2026-04-18）— 实战 Bug 修复 + 可用性补强
 
 > 纯 bug fix + 可用性补强，不增加新工具。工具总数保持 65。
