@@ -1,23 +1,92 @@
 from __future__ import annotations
 
+import json as _json
 import os
 
 from ..server import mcp, browser_manager
 
 
 @mcp.tool()
-async def list_scripts() -> list[dict]:
-    """List all JavaScript scripts loaded in the current page.
+async def scripts(
+    action: str,
+    url: str | None = None,
+    save_path: str | None = None,
+) -> dict | list | str:
+    """Script inspection (v0.9.0 unified).
 
-    Collects both external <script src="..."> and inline <script> elements.
-    For inline scripts, returns a preview of the first 200 characters.
+    Replaces list_scripts / get_script_source / save_script.
+
+    Args:
+        action:
+          "list" — list all loaded scripts (src, type, inline preview)
+          "get"  — get full source of one script (requires url;
+                   use "inline:<index>" for inline scripts)
+          "save" — save script source to local file (requires url + save_path)
+        url: Script URL or "inline:<index>" (required for "get" and "save").
+        save_path: Local file path (required for "save").
 
     Returns:
-        List of dicts with src, type, inline_length, is_module, and preview fields.
+        For "list": list of script info dicts.
+        For "get": dict with source string.
+        For "save": dict with status, path, size.
     """
+    if action == "list":
+        return await _list_scripts()
+    elif action == "get":
+        if not url:
+            return {"error": "url is required for action='get'"}
+        src = await _get_script_source(url)
+        return {"source": src, "url": url, "length": len(src) if isinstance(src, str) else 0}
+    elif action == "save":
+        if not url:
+            return {"error": "url is required for action='save'"}
+        if not save_path:
+            return {"error": "save_path is required for action='save'"}
+        return await _save_script(url, save_path)
+    else:
+        return {"error": f"unknown action: {action}. Use list/get/save"}
+
+
+@mcp.tool()
+async def search_code(
+    keyword: str,
+    script_url: str | None = None,
+    context_chars: int = 200,
+    context_lines: int = 3,
+    max_results: int = 200,
+) -> dict:
+    """Search keyword in loaded scripts (v0.9.0 unified).
+
+    Replaces search_code (all scripts) + search_code_in_script (single script).
+
+    Args:
+        keyword: The keyword to search for (case-sensitive substring match).
+        script_url: If None, search across ALL loaded scripts.
+            If given, search within that one script only (supports
+            "inline:<index>" for inline scripts). Single-script mode
+            auto-detects minified files and uses character-based context.
+        context_chars: Context window in char mode (default 200 = +/-200 chars).
+            Used when searching single minified scripts.
+        context_lines: Context window in line mode (default 3).
+        max_results: Maximum matches to return (default 200).
+
+    Returns:
+        dict with matches, total_matches, mode ("line" | "char"), etc.
+    """
+    if script_url is None:
+        return await _search_code_all(keyword, max_results)
+    else:
+        return await _search_code_in_script(
+            script_url, keyword, context_lines, context_chars, max_results
+        )
+
+
+# ---- internal implementations (not registered as MCP tools) ----
+
+async def _list_scripts() -> list[dict]:
     try:
         page = await browser_manager.get_active_page()
-        scripts = await page.evaluate("""() => {
+        return await page.evaluate("""() => {
             const scripts = document.querySelectorAll('script');
             return Array.from(scripts).map((s, i) => ({
                 index: i,
@@ -28,25 +97,11 @@ async def list_scripts() -> list[dict]:
                 preview: s.src ? null : (s.textContent || '').substring(0, 200)
             }));
         }""")
-        return scripts
     except Exception as e:
         return [{"error": str(e)}]
 
 
-@mcp.tool()
-async def get_script_source(url: str) -> str:
-    """Get the full source code of a JavaScript file by URL.
-
-    For external scripts, fetches the source via the browser's fetch API.
-    For inline scripts, pass the index as "inline:<index>" (e.g. "inline:0")
-    to get the textContent of the corresponding <script> element.
-
-    Args:
-        url: The script URL, or "inline:<index>" for inline scripts.
-
-    Returns:
-        The raw JavaScript source code string.
-    """
+async def _get_script_source(url: str) -> str:
     try:
         page = await browser_manager.get_active_page()
         if url.startswith("inline:"):
@@ -70,26 +125,25 @@ async def get_script_source(url: str) -> str:
         return f"Error: {e}"
 
 
-@mcp.tool()
-async def search_code(keyword: str, max_results: int = 50) -> dict:
-    """Search for a keyword across all loaded JavaScript sources in the page.
+async def _save_script(url: str, save_path: str) -> dict:
+    try:
+        page = await browser_manager.get_active_page()
+        source = await page.evaluate(f"""async () => {{
+            const resp = await fetch("{url}");
+            return await resp.text();
+        }}""")
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(source)
+        return {"status": "saved", "path": save_path, "size": len(source)}
+    except Exception as e:
+        return {"error": str(e)}
 
-    Fetches each script's source and searches for the keyword, returning
-    matching lines with 2 lines of surrounding context.
 
-    Args:
-        keyword: The keyword or pattern to search for (case-sensitive substring match).
-        max_results: Maximum number of matches to return (default 50, max 200).
-
-    Returns:
-        dict with matches list, total_matches count, scripts_searched count,
-        and scripts_with_matches list. When results are truncated, total_matches
-        shows the real total so you know how many were omitted.
-    """
+async def _search_code_all(keyword: str, max_results: int = 50) -> dict:
     try:
         if max_results > 200:
             max_results = 200
-
         page = await browser_manager.get_active_page()
         results = await page.evaluate(f"""async () => {{
             const keyword = {repr(keyword)};
@@ -99,7 +153,6 @@ async def search_code(keyword: str, max_results: int = 50) -> dict:
             let totalMatches = 0;
             let scriptsSearched = 0;
             const scriptsWithMatches = [];
-
             for (const s of scripts) {{
                 let source = '';
                 let scriptUrl = '';
@@ -114,7 +167,6 @@ async def search_code(keyword: str, max_results: int = 50) -> dict:
                     source = s.textContent || '';
                 }}
                 scriptsSearched++;
-
                 const lines = source.split('\\n');
                 let scriptMatchCount = 0;
                 for (let i = 0; i < lines.length; i++) {{
@@ -159,36 +211,13 @@ async def search_code(keyword: str, max_results: int = 50) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
-async def search_code_in_script(
-    script_url: str,
-    keyword: str,
-    context_lines: int = 3,
-    context_chars: int = 200,
+async def _search_code_in_script(
+    script_url: str, keyword: str,
+    context_lines: int = 3, context_chars: int = 200,
     max_results: int = 200,
 ) -> dict:
-    """Search for a keyword within a specific script file.
-
-    v0.6.0: Auto-detects single-line / minified files (<10 lines or any
-    line >5000 chars) and returns CHARACTER-BASED context windows
-    (keyword ± context_chars) instead of line-based. Critical for minified
-    JSVMP files (single-line, 240KB+).
-
-    Args:
-        script_url: URL of the script to search in. Use "inline:<index>" for
-            inline scripts.
-        keyword: The keyword to search for (case-sensitive substring match).
-        context_lines: Context window in line mode (default 3).
-        context_chars: Context window in char mode (default 200 = ±200 chars).
-        max_results: Maximum number of matches (default 200).
-
-    Returns:
-        dict with total_matches, returned, mode ("line" | "char"), results.
-    """
-    import json as _json
     try:
         page = await browser_manager.get_active_page()
-
         if script_url.startswith("inline:"):
             idx = int(script_url.split(":")[1])
             src = await page.evaluate(f"""() => {{
@@ -201,7 +230,6 @@ async def search_code_in_script(
             src = await page.evaluate(
                 f"fetch({_json.dumps(script_url)}, {{cache: 'force-cache'}}).then(r => r.text())"
             )
-
         if not isinstance(src, str):
             return {"error": f"script not fetchable: got {type(src).__name__}"}
 
@@ -230,20 +258,14 @@ async def search_code_in_script(
                         "match_highlight_range": [pos - start, pos - start + len(keyword)],
                     })
                 i = pos + len(keyword)
-
             return {
-                "total_matches": total,
-                "returned": len(results),
-                "script_url": script_url,
-                "mode": "char",
-                "source_size": len(src),
-                "total_lines": len(lines),
+                "total_matches": total, "returned": len(results),
+                "script_url": script_url, "mode": "char",
+                "source_size": len(src), "total_lines": len(lines),
                 "max_line_length": max_line_len,
-                "context_chars": context_chars,
-                "results": results,
+                "context_chars": context_chars, "results": results,
             }
 
-        # Line-based mode
         for idx, line in enumerate(lines):
             if keyword in line:
                 total += 1
@@ -256,64 +278,10 @@ async def search_code_in_script(
                         "context": ctx[:3000] + ("...(truncated)" if len(ctx) > 3000 else ""),
                         "context_range": [start + 1, end],
                     })
-
         return {
-            "total_matches": total,
-            "returned": len(results),
-            "script_url": script_url,
-            "mode": "line",
-            "total_lines": len(lines),
-            "results": results,
+            "total_matches": total, "returned": len(results),
+            "script_url": script_url, "mode": "line",
+            "total_lines": len(lines), "results": results,
         }
     except Exception as e:
         return {"error": str(e)}
-
-
-@mcp.tool()
-async def save_script(url: str, save_path: str) -> dict:
-    """Download a JavaScript file from the page and save it to a local path.
-
-    Args:
-        url: URL of the script to download.
-        save_path: Local file path to save the script to.
-
-    Returns:
-        dict with status, save path, and file size in bytes.
-    """
-    try:
-        page = await browser_manager.get_active_page()
-        source = await page.evaluate(f"""async () => {{
-            const resp = await fetch("{url}");
-            return await resp.text();
-        }}""")
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-        with open(save_path, "w", encoding="utf-8") as f:
-            f.write(source)
-        return {"status": "saved", "path": save_path, "size": len(source)}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-async def get_page_html(selector: str | None = None) -> str:
-    """Get the full page HTML or the outerHTML of a specific element.
-
-    Args:
-        selector: Optional CSS selector. If provided, returns only that
-            element's outerHTML. If omitted, returns the full page HTML.
-
-    Returns:
-        HTML string of the page or selected element.
-    """
-    try:
-        page = await browser_manager.get_active_page()
-        if selector:
-            html = await page.evaluate(f"""() => {{
-                const el = document.querySelector("{selector}");
-                return el ? el.outerHTML : null;
-            }}""")
-            return html or f"Element not found: {selector}"
-        else:
-            return await page.content()
-    except Exception as e:
-        return f"Error: {e}"

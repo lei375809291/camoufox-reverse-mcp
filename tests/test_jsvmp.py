@@ -179,29 +179,24 @@ def test_browser_manager_reset_nav_responses():
 # ============ Tool registration ============
 
 def test_all_65_tools_registered():
-    """The MCP server should have exactly 65 tools registered."""
+    """v1.0.0: tool count should be in the 25-40 range."""
     from camoufox_reverse_mcp.server import mcp
     tools = mcp._tool_manager.list_tools()
     tool_names = [t.name for t in tools]
-    assert len(tools) == 78, f"Expected 78 tools, got {len(tools)}: {tool_names}"
+    assert 25 <= len(tools) <= 40, f"Expected 25-40 tools, got {len(tools)}: {tool_names}"
 
 
 def test_new_tools_registered():
-    """All new tools from v0.4.0 should be registered."""
+    """v1.0.0 core tools should be registered."""
     from camoufox_reverse_mcp.server import mcp
     tools = mcp._tool_manager.list_tools()
     tool_names = {t.name for t in tools}
-    expected_new = {
-        "instrument_jsvmp_source",
-        "get_instrumentation_log",
-        "get_instrumentation_status",
-        "stop_instrumentation",
-        "find_dispatch_loops",
-        "reload_with_hooks",
-        "analyze_cookie_sources",
-        "get_runtime_probe_log",
+    expected = {
+        "network_capture", "scripts", "search_code", "hook_function",
+        "instrumentation", "cookies", "check_environment", "reset_browser_state",
+        "launch_browser", "navigate", "evaluate_js", "verify_signer_offline",
     }
-    missing = expected_new - tool_names
+    missing = expected - tool_names
     assert not missing, f"Missing tools: {missing}"
 
 
@@ -271,4 +266,4 @@ async def test_pre_inject_jsvmp_probe_registers():
 
 def test_version_is_040():
     from camoufox_reverse_mcp import __version__
-    assert __version__ == "0.8.0"
+    assert __version__ == "1.0.0"

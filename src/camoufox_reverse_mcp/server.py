@@ -11,7 +11,14 @@ mcp = FastMCP(
 
 browser_manager = BrowserManager()
 
-from .tools import navigation, script_analysis, debugging, hooking, network, storage, fingerprint, jsvmp  # noqa: E402, F401
-from .tools import cookie_analysis, instrumentation  # noqa: E402, F401
-from .tools import session  # noqa: E402, F401
-from .tools import assertions  # noqa: E402, F401
+# v1.0.0: pure JS reverse-engineering toolkit (session/assertions removed)
+from .tools import navigation      # noqa: E402, F401  — browser control + page interaction
+from .tools import script_analysis  # noqa: E402, F401  — scripts() + search_code()
+from .tools import debugging        # noqa: E402, F401  — evaluate_js
+from .tools import hooking          # noqa: E402, F401  — hook_function + inject_hook_preset + remove_hooks
+from .tools import network          # noqa: E402, F401  — network_capture + list/get requests
+from .tools import storage          # noqa: E402, F401  — cookies() + get_storage + export/import state
+from .tools import jsvmp            # noqa: E402, F401  — hook_jsvmp_interpreter + compare_env
+from .tools import instrumentation  # noqa: E402, F401  — instrumentation(action=...)
+from .tools import environment      # noqa: E402, F401  — check_environment
+from .tools import verification     # noqa: E402, F401  — verify_signer_offline

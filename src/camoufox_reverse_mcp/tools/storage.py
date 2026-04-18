@@ -7,84 +7,68 @@ from ..server import mcp, browser_manager
 
 
 @mcp.tool()
-async def get_cookies(domain: str | None = None) -> list[dict]:
-    """Get all cookies from the current browser context.
+async def cookies(
+    action: str,
+    domain: str | None = None,
+    cookies_list: list[dict] | None = None,
+    name: str | None = None,
+) -> dict | list:
+    """Cookie management (v0.9.0 unified).
+
+    Replaces get_cookies / set_cookies / delete_cookies.
 
     Args:
-        domain: Optional domain filter (e.g. ".example.com").
+        action:
+          "get"   — return cookies (optionally filtered by domain)
+          "set"   — set cookies (requires cookies_list: [{name, value, domain, ...}])
+          "delete" — delete cookies (filter by name and/or domain; no filter = clear all)
+        domain: Domain filter for "get" and "delete" (e.g. ".example.com").
+        cookies_list: List of cookie dicts for "set".
+        name: Cookie name filter for "delete".
 
     Returns:
-        List of cookie dicts with name, value, domain, path, expires, etc.
+        For "get": list of cookie dicts.
+        For "set"/"delete": dict with status and count.
     """
     try:
         page = await browser_manager.get_active_page()
         ctx = page.context
-        cookies = await ctx.cookies()
-        if domain:
-            cookies = [c for c in cookies if domain in c.get("domain", "")]
-        return cookies
-    except Exception as e:
-        return [{"error": str(e)}]
 
+        if action == "get":
+            all_cookies = await ctx.cookies()
+            if domain:
+                all_cookies = [c for c in all_cookies if domain in c.get("domain", "")]
+            return all_cookies
 
-@mcp.tool()
-async def set_cookies(cookies: list[dict]) -> dict:
-    """Add cookies to the current browser context.
+        elif action == "set":
+            if not cookies_list:
+                return {"error": "cookies_list is required for action='set'"}
+            await ctx.add_cookies(cookies_list)
+            return {"status": "set", "count": len(cookies_list)}
 
-    Args:
-        cookies: List of cookie dicts. Each should contain at minimum:
-            - name: Cookie name
-            - value: Cookie value
-            - domain: Cookie domain (e.g. ".example.com")
-            Optional: path, expires, httpOnly, secure, sameSite.
+        elif action == "delete":
+            all_cookies = await ctx.cookies()
+            to_keep = []
+            deleted = 0
+            for c in all_cookies:
+                should_delete = False
+                if name and c["name"] == name:
+                    should_delete = True
+                if domain and domain in c.get("domain", ""):
+                    should_delete = True
+                if not name and not domain:
+                    should_delete = True
+                if should_delete:
+                    deleted += 1
+                else:
+                    to_keep.append(c)
+            await ctx.clear_cookies()
+            if to_keep:
+                await ctx.add_cookies(to_keep)
+            return {"status": "deleted", "count": deleted}
 
-    Returns:
-        dict with status and count of cookies set.
-    """
-    try:
-        page = await browser_manager.get_active_page()
-        ctx = page.context
-        await ctx.add_cookies(cookies)
-        return {"status": "set", "count": len(cookies)}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-async def delete_cookies(name: str | None = None, domain: str | None = None) -> dict:
-    """Delete cookies by name and/or domain.
-
-    Args:
-        name: Specific cookie name to delete.
-        domain: Delete all cookies for this domain.
-
-    Returns:
-        dict with status and count of cookies deleted.
-    """
-    try:
-        page = await browser_manager.get_active_page()
-        ctx = page.context
-        cookies = await ctx.cookies()
-
-        to_keep = []
-        deleted = 0
-        for c in cookies:
-            should_delete = False
-            if name and c["name"] == name:
-                should_delete = True
-            if domain and domain in c.get("domain", ""):
-                should_delete = True
-            if not name and not domain:
-                should_delete = True
-            if should_delete:
-                deleted += 1
-            else:
-                to_keep.append(c)
-
-        await ctx.clear_cookies()
-        if to_keep:
-            await ctx.add_cookies(to_keep)
-        return {"status": "deleted", "count": deleted}
+        else:
+            return {"error": f"unknown action: {action}. Use get/set/delete"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -127,31 +111,6 @@ async def get_storage(storage_type: str = "local") -> dict:
 
 
 @mcp.tool()
-async def set_storage(storage_type: str, key: str, value: str) -> dict:
-    """Set a value in localStorage or sessionStorage.
-
-    Args:
-        storage_type: "local" or "session".
-        key: Storage key.
-        value: Storage value.
-
-    Returns:
-        dict with status, storage type, and the key set.
-    """
-    try:
-        page = await browser_manager.get_active_page()
-        if storage_type == "local":
-            await page.evaluate(f"localStorage.setItem({json.dumps(key)}, {json.dumps(value)})")
-        elif storage_type == "session":
-            await page.evaluate(f"sessionStorage.setItem({json.dumps(key)}, {json.dumps(value)})")
-        else:
-            return {"error": f"Invalid storage_type: {storage_type}"}
-        return {"status": "set", "storage_type": storage_type, "key": key}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
 async def export_state(save_path: str) -> dict:
     """Export the complete browser state (cookies + storage) to a JSON file.
 
@@ -174,9 +133,6 @@ async def export_state(save_path: str) -> dict:
 @mcp.tool()
 async def import_state(state_path: str) -> dict:
     """Import browser state from a JSON file by creating a new context.
-
-    Creates a new browser context with the saved state (cookies, localStorage,
-    sessionStorage) and switches to it.
 
     Args:
         state_path: Path to the state JSON file (exported by export_state).

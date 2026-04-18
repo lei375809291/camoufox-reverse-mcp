@@ -7,50 +7,57 @@ from ..server import mcp, browser_manager
 
 
 @mcp.tool()
-async def start_network_capture(
+async def network_capture(
+    action: str,
     url_pattern: str = "**/*",
     capture_body: bool = False,
 ) -> dict:
-    """Start capturing network requests matching the given URL pattern.
+    """Unified network capture control (v0.9.0).
 
-    Captured data includes URL, method, headers, body, status, response headers,
-    resource type, timing, etc. Use list_network_requests to view captures.
+    Replaces start_network_capture / stop_network_capture.
 
     Args:
-        url_pattern: Glob pattern to filter captured URLs (default "**/*" captures all).
-        capture_body: If True, also capture response bodies. This increases memory
-            usage but allows inspecting actual response data. Default False.
+        action:
+          "start"  — begin capturing network events
+          "stop"   — stop capturing (buffer retained)
+          "clear"  — clear the capture buffer
+          "status" — return current capture state
+        url_pattern: Glob pattern for "start" (default "**/*" captures all).
+        capture_body: For "start" only; capture response bodies (more memory).
 
     Returns:
-        dict with status and the active capture pattern.
+        dict with action result + current status snapshot.
     """
-    try:
+    if action == "start":
         browser_manager._capturing = True
         browser_manager._capture_pattern = url_pattern
         browser_manager._capture_body = capture_body
-        return {"status": "capturing", "pattern": url_pattern, "capture_body": capture_body}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-async def stop_network_capture() -> dict:
-    """Stop capturing network requests.
-
-    Returns:
-        dict with status and total number of captured requests.
-    """
-    try:
+        return {"status": "capturing", "pattern": url_pattern,
+                "capture_body": capture_body}
+    elif action == "stop":
         browser_manager._capturing = False
-        total = len(browser_manager._network_requests)
-        return {"status": "stopped", "total_requests": total}
-    except Exception as e:
-        return {"error": str(e)}
+        return {"status": "stopped",
+                "total_requests": len(browser_manager._network_requests)}
+    elif action == "clear":
+        count = len(browser_manager._network_requests)
+        browser_manager._network_requests.clear()
+        browser_manager._request_id_counter = 0
+        return {"status": "cleared", "cleared_count": count}
+    elif action == "status":
+        return {
+            "active": browser_manager._capturing,
+            "pattern": browser_manager._capture_pattern,
+            "capture_body": browser_manager._capture_body,
+            "buffer_size": len(browser_manager._network_requests),
+        }
+    else:
+        return {"error": f"unknown action: {action}. Use start/stop/clear/status"}
 
 
 @mcp.tool()
 async def list_network_requests(
     url_filter: str | None = None,
+    url_contains_domain: str | None = None,
     method: str | None = None,
     resource_type: str | None = None,
     status_code: int | None = None,
@@ -59,17 +66,20 @@ async def list_network_requests(
 
     Args:
         url_filter: Substring filter for request URLs.
+        url_contains_domain: Convenience domain filter (e.g. 'nmpa.gov.cn').
         method: HTTP method filter (e.g. "GET", "POST").
         resource_type: Resource type filter (e.g. "xhr", "fetch", "script", "document").
         status_code: HTTP status code filter.
 
     Returns:
-        List of request summaries with id, url, method, status, resource_type, duration, size.
+        List of request summaries with id, url, method, status, type, ms, size.
     """
     try:
         reqs = list(browser_manager._network_requests)
         if url_filter:
             reqs = [r for r in reqs if url_filter in r["url"]]
+        if url_contains_domain:
+            reqs = [r for r in reqs if url_contains_domain in r.get("url", "")]
         if method:
             reqs = [r for r in reqs if r["method"].upper() == method.upper()]
         if resource_type:
@@ -79,17 +89,11 @@ async def list_network_requests(
 
         summaries = []
         for r in reqs:
-            body_size = 0
-            if r.get("response_body"):
-                body_size = len(r["response_body"])
+            body_size = len(r["response_body"]) if r.get("response_body") else 0
             summaries.append({
-                "id": r["id"],
-                "url": r["url"][:200],
-                "method": r["method"],
-                "status": r.get("status"),
-                "type": r.get("resource_type"),
-                "ms": r.get("duration"),
-                "size": body_size,
+                "id": r["id"], "url": r["url"][:200], "method": r["method"],
+                "status": r.get("status"), "type": r.get("resource_type"),
+                "ms": r.get("duration"), "size": body_size,
                 "has_body": body_size > 0,
             })
         return summaries
@@ -100,15 +104,17 @@ async def list_network_requests(
 @mcp.tool()
 async def get_network_request(
     request_id: int,
-    include_body: bool = True,
+    include_body: bool = False,
     include_headers: bool = True,
+    max_body_size: int = 5000,
 ) -> dict:
     """Get full details of a specific captured network request.
 
     Args:
         request_id: The ID of the request (from list_network_requests).
-        include_body: Include response body (default True). Set False for large responses.
-        include_headers: Include request/response headers (default True). Set False to save tokens.
+        include_body: Include response body (default False).
+        include_headers: Include request/response headers (default True).
+        max_body_size: Max chars of body when include_body=True. Pass -1 for unlimited.
 
     Returns:
         dict with request and response details.
@@ -122,6 +128,17 @@ async def get_network_request(
                     result["response_body_available"] = body is not None
                     if body:
                         result["response_body_size"] = len(body)
+                else:
+                    body = result.get("response_body")
+                    if body is not None and max_body_size >= 0 and len(body) > max_body_size:
+                        result["response_body"] = body[:max_body_size]
+                        result["response_body_truncated"] = True
+                        result["response_body_original_size"] = len(body)
+                        result["response_body_size_returned"] = max_body_size
+                    elif body is not None:
+                        result["response_body_truncated"] = False
+                        result["response_body_original_size"] = len(body)
+                        result["response_body_size_returned"] = len(body)
                 if not include_headers:
                     result.pop("request_headers", None)
                     result.pop("response_headers", None)
@@ -134,16 +151,23 @@ async def get_network_request(
 @mcp.tool()
 async def get_request_initiator(request_id: int) -> dict:
     """Get the JS call stack that initiated a network request.
-    Golden path: see encrypted param → get_request_initiator → find signing function.
+
+    Golden path: see encrypted param -> get_request_initiator -> find signing function.
     Requires inject_hook_preset("xhr"/"fetch") BEFORE navigating.
 
-    v0.6.0: If Playwright-native initiator is unavailable (common for fetch
-    on Firefox), automatically tries window.__mcp_fetch_initiator_log
-    (requires fetch_hook.js). Returns source="native"|"fetch_hook"|"xhr_hook"
-    so callers know which path succeeded.
+    KNOWN LIMITATIONS (v0.8.1+):
+      1. For requests modified by an interceptor registered BEFORE MCP's
+         hooks (e.g. SDKs loaded via sync <script>), the initiator will be
+         the interceptor's call, not the original business code.
+         Workaround: use reload_with_hooks().
+      2. For fetch on Firefox, Playwright-native initiator is often null.
+         Requires inject_hook_preset('fetch', persistent=True).
 
     Args:
         request_id: The ID of the request.
+
+    Returns:
+        dict with url, initiator_stack, source, diagnostics.
     """
     try:
         target_entry = None
@@ -167,19 +191,16 @@ async def get_request_initiator(request_id: int) -> dict:
                     const logUrl = log.url || '';
                     if (reqUrl === logUrl || reqUrl.includes(logUrl) || logUrl.includes(reqUrl)) {{
                         return {{
-                            url: logUrl,
-                            stack: log.stack || null,
-                            type: type,
-                            method: log.method,
-                            headers: log.headers,
+                            url: logUrl, stack: log.stack || null, type: type,
+                            method: log.method, headers: log.headers,
                             body: log.body ? String(log.body).substring(0, 2000) : null,
                             timestamp: log.timestamp
                         }};
                     }}
                     try {{
-                        const urlObj1 = new URL(reqUrl, location.origin);
-                        const urlObj2 = new URL(logUrl, location.origin);
-                        if (urlObj1.pathname === urlObj2.pathname && urlObj1.host === urlObj2.host) {{
+                        const u1 = new URL(reqUrl, location.origin);
+                        const u2 = new URL(logUrl, location.origin);
+                        if (u1.pathname === u2.pathname && u1.host === u2.host) {{
                             return {{
                                 url: logUrl, stack: log.stack || null, type: type,
                                 method: log.method, headers: log.headers,
@@ -191,73 +212,60 @@ async def get_request_initiator(request_id: int) -> dict:
                 }}
                 return null;
             }}
-
-            // Try XHR hook log
             const xhrResult = searchLogs(window.__mcp_xhr_log, 'xhr');
             if (xhrResult) return xhrResult;
-
-            // Try fetch hook log (general)
             const fetchResult = searchLogs(window.__mcp_fetch_log, 'fetch');
             if (fetchResult) return fetchResult;
-
-            // v0.6.0: Try dedicated fetch initiator log (has cleaner stacks)
             const fetchInitLog = window.__mcp_fetch_initiator_log || [];
             for (let i = fetchInitLog.length - 1; i >= 0; i--) {{
                 const entry = fetchInitLog[i];
                 const logUrl = entry.url || '';
                 if (reqUrl === logUrl || reqUrl.includes(logUrl) || logUrl.includes(reqUrl)) {{
-                    return {{
-                        url: logUrl,
-                        stack: entry.stack || null,
-                        type: 'fetch_hook',
-                        method: entry.method,
-                        timestamp: entry.ts
-                    }};
+                    return {{ url: logUrl, stack: entry.stack || null, type: 'fetch_hook',
+                              method: entry.method, timestamp: entry.ts }};
                 }}
                 try {{
                     const u1 = new URL(reqUrl, location.origin);
                     const u2 = new URL(logUrl, location.origin);
                     if (u1.pathname === u2.pathname && u1.host === u2.host) {{
-                        return {{
-                            url: logUrl, stack: entry.stack || null, type: 'fetch_hook',
-                            method: entry.method, timestamp: entry.ts
-                        }};
+                        return {{ url: logUrl, stack: entry.stack || null, type: 'fetch_hook',
+                                  method: entry.method, timestamp: entry.ts }};
                     }}
                 }} catch(e) {{}}
             }}
-
-            const hasXhrHook = !!window.__mcp_xhr_hooked;
-            const hasFetchHook = !!window.__mcp_fetch_hooked;
-            const xhrLogCount = Array.isArray(window.__mcp_xhr_log) ? window.__mcp_xhr_log.length : 0;
-            const fetchLogCount = Array.isArray(window.__mcp_fetch_log) ? window.__mcp_fetch_log.length : 0;
-            const fetchInitCount = fetchInitLog.length;
-
             return {{
-                url: reqUrl,
-                stack: null,
-                type: 'unknown',
+                url: reqUrl, stack: null, type: 'unknown',
                 diagnostics: {{
-                    xhr_hook_active: hasXhrHook,
-                    xhr_log_entries: xhrLogCount,
-                    fetch_hook_active: hasFetchHook,
-                    fetch_log_entries: fetchLogCount,
-                    fetch_initiator_entries: fetchInitCount,
-                    hint: !hasXhrHook && !hasFetchHook
-                        ? 'No hooks detected. Call inject_hook_preset("xhr") and inject_hook_preset("fetch") with persistent=True BEFORE navigating.'
+                    xhr_hook_active: !!window.__mcp_xhr_hooked,
+                    fetch_hook_active: !!window.__mcp_fetch_hooked,
+                    hint: !window.__mcp_xhr_hooked && !window.__mcp_fetch_hooked
+                        ? 'No hooks detected. Call inject_hook_preset("xhr"/"fetch") BEFORE navigating.'
                         : 'Hooks active but no matching URL found in logs.'
                 }}
             }};
         }}""")
 
+        source = result.get("type", "unknown")
         return {
             "url": result.get("url"),
             "initiator_stack": result.get("stack"),
-            "initiator_type": result.get("type"),
-            "source": result.get("type", "unknown"),
+            "initiator_type": source,
+            "source": source,
             "method": result.get("method"),
             "request_headers": result.get("headers"),
             "request_body": result.get("body"),
             "diagnostics": result.get("diagnostics"),
+            "diagnostic": (
+                {
+                    "likely_causes": [
+                        "hook registered after SDK (try reload_with_hooks)",
+                        "request made inside a sync-loaded SDK interceptor",
+                        "fetch_hook.js not injected",
+                    ],
+                    "recommended_action": "Use reload_with_hooks() or inject hooks before navigate.",
+                }
+                if source in ("unknown", None) else None
+            ),
         }
     except Exception as e:
         return {"error": str(e)}
@@ -275,7 +283,7 @@ async def intercept_request(
 
     Args:
         url_pattern: URL glob pattern (e.g. "**/api/login*").
-        action: "log", "block", "modify", or "mock".
+        action: "log", "block", "modify", "mock", or "stop" (unroute).
         modify_headers: Headers to add/override (action="modify").
         modify_body: Request body replacement (action="modify").
         mock_response: Dict with "status", "headers", "body" (action="mock").
@@ -283,14 +291,20 @@ async def intercept_request(
     try:
         page = await browser_manager.get_active_page()
 
+        if action == "stop":
+            if url_pattern:
+                await page.unroute(url_pattern)
+                return {"status": "stopped", "pattern": url_pattern}
+            else:
+                await page.unroute("**/*")
+                return {"status": "stopped_all"}
+
         async def handler(route):
             if action == "log":
-                request = route.request
                 browser_manager._console_logs.append({
                     "level": "info",
-                    "text": f"[INTERCEPT:log] {request.method} {request.url}",
-                    "timestamp": time.time() * 1000,
-                    "location": None,
+                    "text": f"[INTERCEPT:log] {route.request.method} {route.request.url}",
+                    "timestamp": time.time() * 1000, "location": None,
                 })
                 await route.continue_()
             elif action == "block":
@@ -312,183 +326,5 @@ async def intercept_request(
 
         await page.route(url_pattern, handler)
         return {"status": "intercepting", "pattern": url_pattern, "action": action}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-async def stop_intercept(url_pattern: str | None = None) -> dict:
-    """Stop intercepting requests.
-
-    Args:
-        url_pattern: Specific pattern to stop intercepting.
-            If omitted, stops all interceptions.
-
-    Returns:
-        dict with status.
-    """
-    try:
-        page = await browser_manager.get_active_page()
-        if url_pattern:
-            await page.unroute(url_pattern)
-            return {"status": "stopped", "pattern": url_pattern}
-        else:
-            await page.unroute("**/*")
-            return {"status": "stopped_all"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-async def search_response_body(
-    keyword: str,
-    url_filter: str | None = None,
-    max_results: int = 20,
-) -> dict:
-    """Search for a keyword across all captured response bodies.
-
-    Requires start_network_capture(capture_body=True) to have been called first.
-
-    Args:
-        keyword: Substring to search for in response bodies (case-insensitive).
-        url_filter: Optional URL substring to narrow the search scope.
-        max_results: Maximum matches to return (default 20).
-
-    Returns:
-        dict with matches (request id, url, context around match) and total count.
-    """
-    try:
-        reqs = list(browser_manager._network_requests)
-        if url_filter:
-            reqs = [r for r in reqs if url_filter in r["url"]]
-
-        matches = []
-        kw_lower = keyword.lower()
-        for r in reqs:
-            body = r.get("response_body")
-            if not body:
-                continue
-            body_lower = body.lower()
-            pos = 0
-            while pos < len(body_lower) and len(matches) < max_results:
-                idx = body_lower.find(kw_lower, pos)
-                if idx == -1:
-                    break
-                start = max(0, idx - 80)
-                end = min(len(body), idx + len(keyword) + 80)
-                matches.append({
-                    "request_id": r["id"],
-                    "url": r["url"][:200],
-                    "offset": idx,
-                    "context": body[start:end],
-                })
-                pos = idx + len(keyword)
-
-        return {"keyword": keyword, "matches": matches, "total": len(matches)}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-async def get_response_body_page(
-    request_id: int,
-    offset: int = 0,
-    length: int = 10000,
-) -> dict:
-    """Read a slice of a captured response body for paginated viewing of large responses.
-
-    Args:
-        request_id: The request ID (from list_network_requests).
-        offset: Character offset to start reading from (default 0).
-        length: Number of characters to read (default 10000, max 50000).
-
-    Returns:
-        dict with body slice, total size, and whether more data is available.
-    """
-    try:
-        if length > 50000:
-            length = 50000
-        for r in browser_manager._network_requests:
-            if r["id"] == request_id:
-                body = r.get("response_body")
-                if body is None:
-                    return {"error": "No body captured. Use start_network_capture(capture_body=True)."}
-                total = len(body)
-                slice_ = body[offset:offset + length]
-                return {
-                    "body": slice_,
-                    "offset": offset,
-                    "length": len(slice_),
-                    "total_size": total,
-                    "has_more": offset + length < total,
-                }
-        return {"error": f"Request ID {request_id} not found"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-async def search_json_path(
-    request_id: int,
-    json_path: str,
-) -> dict:
-    """Extract a value from a captured JSON response body by dot-notation path.
-
-    Supports array indexing like "data.items[0].name" or "data.list[*].id"
-    (wildcard returns all matching values).
-
-    Args:
-        request_id: The request ID.
-        json_path: Dot-notation path, e.g. "data.token", "result[0].sign",
-            "data[*].id" (wildcard collects all).
-
-    Returns:
-        dict with the extracted value(s) and the path used.
-    """
-    try:
-        body_text = None
-        for r in browser_manager._network_requests:
-            if r["id"] == request_id:
-                body_text = r.get("response_body")
-                break
-        if body_text is None:
-            return {"error": f"Request ID {request_id} not found or no body captured."}
-
-        data = json.loads(body_text)
-
-        def _extract(obj, parts):
-            if not parts:
-                return obj
-            part = parts[0]
-            rest = parts[1:]
-            # handle array index like "items[0]" or "items[*]"
-            if "[" in part:
-                key, idx_str = part.split("[", 1)
-                idx_str = idx_str.rstrip("]")
-                obj = obj[key] if key else obj
-                if idx_str == "*":
-                    if not isinstance(obj, list):
-                        return {"error": f"Not an array at '{key}'"}
-                    return [_extract(item, rest) for item in obj]
-                else:
-                    return _extract(obj[int(idx_str)], rest)
-            else:
-                if isinstance(obj, dict):
-                    return _extract(obj[part], rest)
-                return _extract(getattr(obj, part), rest)
-
-        parts = json_path.split(".")
-        result = _extract(data, parts)
-
-        result_str = json.dumps(result, ensure_ascii=False, default=str)
-        if len(result_str) > 20000:
-            result_str = result_str[:20000] + f"... (truncated, total {len(result_str)} chars)"
-            return {"path": json_path, "value_preview": result_str}
-
-        return {"path": json_path, "value": result}
-    except json.JSONDecodeError:
-        return {"error": "Response body is not valid JSON."}
-    except (KeyError, IndexError, TypeError) as e:
-        return {"error": f"Path '{json_path}' not found: {e}"}
     except Exception as e:
         return {"error": str(e)}
