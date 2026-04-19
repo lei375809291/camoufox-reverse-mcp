@@ -86,7 +86,7 @@ async def search_code(
 async def _list_scripts() -> list[dict]:
     try:
         page = await browser_manager.get_active_page()
-        return await page.evaluate("""() => {
+        scripts_list = await page.evaluate("""() => {
             const scripts = document.querySelectorAll('script');
             return Array.from(scripts).map((s, i) => ({
                 index: i,
@@ -97,6 +97,21 @@ async def _list_scripts() -> list[dict]:
                 preview: s.src ? null : (s.textContent || '').substring(0, 200)
             }));
         }""")
+        # v1.0.1: add hint for large scripts
+        for s in scripts_list:
+            size = s.get("inline_length", 0)
+            src = s.get("src")
+            if src and size == 0:
+                # For external scripts, we don't know size yet from DOM alone
+                # but we can hint based on common patterns
+                pass
+            elif size > 100_000:
+                s["hint"] = (
+                    f"Large script ({size} bytes). Consider saving for "
+                    f"offline analysis: scripts(action='save', "
+                    f"url='inline:{s['index']}', save_path='./script_{s['index']}.js')"
+                )
+        return scripts_list
     except Exception as e:
         return [{"error": str(e)}]
 

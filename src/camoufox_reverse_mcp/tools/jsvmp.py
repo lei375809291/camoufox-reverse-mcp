@@ -26,6 +26,17 @@ async def hook_jsvmp_interpreter(
     For those, use instrumentation(action='install') (source-level rewrite) or
     mode='transparent' instead.
 
+    IMPORTANT — timing for sync-loaded SDKs (e.g. webmssdk):
+        JSVMP interpreters capture native references at startup via closures.
+        If you install hooks AFTER the SDK has loaded, the SDK's closures
+        already hold the original (un-hooked) references — your hooks will
+        never fire. You MUST install hooks BEFORE navigate():
+          1. launch_browser()
+          2. hook_jsvmp_interpreter(mode='transparent', persistent=True)
+          3. navigate("https://www.douyin.com/...")
+        If already navigated, call instrumentation(action='reload') after
+        installing hooks to force a page reload with hooks active.
+
     Args:
         script_url: Target script URL substring for stack filtering.
         persistent: Survive navigation (default True).
@@ -53,16 +64,28 @@ async def hook_jsvmp_interpreter(
             if persistent:
                 await browser_manager.add_persistent_script(
                     f"jsvmp_transparent:{script_url or 'all'}", hook_js)
+            # v1.0.1: detect if page already loaded (timing issue)
+            page_already_loaded = page.url and page.url != "about:blank"
             try:
                 await page.evaluate(hook_js)
             except Exception as e:
                 return {"status": "partial", "mode": "transparent",
                         "warning": f"Evaluate failed: {e}", "persistent": persistent}
-            return {
+            result = {
                 "status": "instrumented", "mode": "transparent",
                 "script_url": script_url or "(all)", "persistent": persistent,
                 "data_location": "window.__mcp_jsvmp_log",
             }
+            if page_already_loaded:
+                result["warnings"] = [
+                    "Hooks installed on already-loaded page. If the target "
+                    "SDK (e.g. webmssdk) was loaded BEFORE this call, it "
+                    "likely captured native references at startup (closure "
+                    "capture) and won't trigger your hooks. Call "
+                    "instrumentation(action='reload') or re-navigate to "
+                    "force SDK re-init with hooks in place."
+                ]
+            return result
 
         elif mode == "proxy":
             if proxy_objects is None:
@@ -80,17 +103,31 @@ async def hook_jsvmp_interpreter(
             if persistent:
                 await browser_manager.add_persistent_script(
                     f"jsvmp_probe:{script_url or 'all'}", hook_js)
+            # v1.0.1: detect if page already loaded (timing issue)
+            page_already_loaded = page.url and page.url != "about:blank"
             try:
                 await page.evaluate(hook_js)
             except Exception as e:
                 return {"status": "partial", "mode": "proxy",
                         "warning": f"Evaluate failed: {e}", "persistent": persistent}
-            return {
+            result = {
                 "status": "instrumented", "mode": "proxy",
                 "script_url": script_url or "(all)", "persistent": persistent,
                 "data_location": "window.__mcp_jsvmp_log",
                 "warning": "proxy mode is detectable by RS/AK-style anti-bot.",
             }
+            if page_already_loaded:
+                result.setdefault("warnings", [])
+                if isinstance(result.get("warning"), str):
+                    result["warnings"].append(result.pop("warning"))
+                result["warnings"].append(
+                    "Hooks installed on already-loaded page. If the target "
+                    "SDK was loaded BEFORE this call, it likely captured "
+                    "native references at startup (closure capture) and "
+                    "won't trigger your hooks. Call "
+                    "instrumentation(action='reload') to re-trigger."
+                )
+            return result
         else:
             return {"error": f"unknown mode '{mode}', use 'proxy' or 'transparent'"}
     except Exception as e:

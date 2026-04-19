@@ -56,8 +56,16 @@ def ast_rewrite(
     rewrite_member_access: bool = True,
     rewrite_calls: bool = True,
     max_edits: int = 20000,
+    filter_property_names: list[str] | None = None,
+    filter_object_names: list[str] | None = None,
 ) -> tuple[str | None, dict]:
     """Rewrite JS source via esprima-python AST walk.
+
+    Args:
+        filter_property_names: If set, only rewrite member access where the
+            property name is in this list (e.g. ['userAgent', 'platform']).
+        filter_object_names: If set, only rewrite member access where the
+            base object identifier is in this list (e.g. ['navigator', 'screen']).
 
     Returns:
         (rewritten_source_with_runtime, stats) on success.
@@ -79,6 +87,8 @@ def ast_rewrite(
 
     edits: list[dict] = []
     tag_lit = json.dumps(tag)
+    prop_filter = set(filter_property_names) if filter_property_names else None
+    obj_filter = set(filter_object_names) if filter_object_names else None
 
     def emit_member_tap(node, parent):
         pt = getattr(parent, 'type', None) if parent else None
@@ -116,6 +126,28 @@ def ast_rewrite(
         node_range = getattr(node, 'range', None)
         if node_range is None:
             return False
+
+        # v1.0.1: selective filtering for large files
+        if prop_filter or obj_filter:
+            # Extract property name for filtering
+            if node.computed:
+                # For computed access obj[key], check if key is a string literal
+                prop_type = getattr(prop, 'type', None)
+                if prop_type == 'Literal':
+                    prop_name = getattr(prop, 'value', None)
+                else:
+                    prop_name = None
+            else:
+                prop_name = getattr(prop, 'name', None)
+
+            # Extract object name for filtering
+            obj_type = getattr(obj, 'type', None)
+            obj_name = getattr(obj, 'name', None) if obj_type == 'Identifier' else None
+
+            if prop_filter and (prop_name is None or prop_name not in prop_filter):
+                return False
+            if obj_filter and (obj_name is None or obj_name not in obj_filter):
+                return False
 
         edits.append({
             "start": node_range[0], "end": node_range[1],

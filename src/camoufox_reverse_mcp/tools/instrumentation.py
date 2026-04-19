@@ -1,8 +1,8 @@
 """
-instrumentation.py - Source-level JSVMP instrumentation (v0.9.0 unified).
+instrumentation.py - Source-level JSVMP instrumentation (v1.0.0 unified).
 
-Merges instrument_jsvmp_source / get_instrumentation_log /
-stop_instrumentation / reload_with_hooks into a single tool.
+v1.0.1 bugfix: route uses context.route() instead of page.route(),
+selective instrumentation for large files, timing diagnostics.
 """
 from __future__ import annotations
 import time
@@ -37,6 +37,10 @@ async def instrumentation(
     key_filter: str | None = None,
     limit: int = 500,
     clear: bool = False,
+    filter_property_names: list[str] | None = None,
+    filter_object_names: list[str] | None = None,
+    max_file_size: int = 200_000,
+    on_oversized: str = "selective",
 ) -> dict:
     """JSVMP source-level instrumentation (v0.9.0 unified).
 
@@ -70,13 +74,35 @@ async def instrumentation(
         key_filter: For "log" — substring match on property/method name.
         limit: For "log" — max entries to return.
         clear: For "log" — clear log after retrieval.
+        filter_property_names: For "install" — only rewrite access to these
+            property names (e.g. ['userAgent', 'platform', 'webdriver']).
+            Dramatically reduces overhead for large files like webmssdk.
+        filter_object_names: For "install" — only rewrite when base object
+            matches (e.g. ['navigator', 'screen', 'document']).
+        max_file_size: For "install" — files larger than this (bytes) trigger
+            on_oversized behavior. Default 200KB.
+        on_oversized: For "install" — "selective" (require filters), "skip",
+            or "force" (full rewrite anyway). Default "selective".
 
     Returns:
         dict with action-specific results.
+
+    IMPORTANT — timing for sync-loaded scripts (e.g. webmssdk):
+        Route interception only catches requests made AFTER the route is
+        registered. For scripts loaded via <script src> during page load,
+        you MUST call instrumentation(action='install') BEFORE navigate().
+        Pattern:
+          1. launch_browser()
+          2. instrumentation(action='install', url_pattern='**/webmssdk*')
+          3. navigate("https://www.douyin.com/...")
+        If called after navigate, use instrumentation(action='reload') to
+        re-trigger page load with routes active.
     """
     if action == "install":
         return await _install(url_pattern, mode, tag, rewrite_member_access,
-                              rewrite_calls, max_rewrites, fallback_on_error, ignore_csp)
+                              rewrite_calls, max_rewrites, fallback_on_error,
+                              ignore_csp, filter_property_names,
+                              filter_object_names, max_file_size, on_oversized)
     elif action == "log":
         return await _get_log(tag_filter, type_filter, key_filter, limit, clear)
     elif action == "stop":
@@ -105,61 +131,46 @@ def _get_status() -> dict:
     }
 
 
-async def _detect_csp_risk(page) -> dict:
-    try:
-        probe = await page.evaluate(r"""
-          (async () => {
-            return new Promise(resolve => {
-              var marker = '__mcp_csp_probe_' + Math.random().toString(36).slice(2);
-              var s = document.createElement('script');
-              s.textContent = 'window["' + marker + '"] = 1;';
-              var violated = false;
-              var handler = function(e) {
-                if (e.violatedDirective && e.violatedDirective.indexOf('script-src') !== -1) {
-                  violated = true;
-                }
-              };
-              document.addEventListener('securitypolicyviolation', handler, { once: true });
-              try { document.head.appendChild(s); } catch (e) {}
-              try { document.head.removeChild(s); } catch (e) {}
-              setTimeout(() => {
-                document.removeEventListener('securitypolicyviolation', handler);
-                var ran = window[marker] === 1;
-                try { delete window[marker]; } catch (e) {}
-                var meta = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
-                resolve({ ran: ran, violated: violated, csp_meta: meta ? meta.content : null });
-              }, 80);
-            });
-          })()
-        """)
-    except Exception:
-        return {"blocks": False, "csp_meta": None, "reasons": []}
-    reasons: list[str] = []
-    blocks = bool(probe.get("violated") or not probe.get("ran"))
-    if blocks:
-        reasons.append("inline <script> execution blocked or violated CSP")
-    return {"blocks": blocks, "csp_meta": probe.get("csp_meta"), "reasons": reasons}
-
-
 async def _install(url_pattern, mode, tag, rewrite_member_access,
-                   rewrite_calls, max_rewrites, fallback_on_error, ignore_csp) -> dict:
+                   rewrite_calls, max_rewrites, fallback_on_error, ignore_csp,
+                   filter_property_names, filter_object_names,
+                   max_file_size, on_oversized) -> dict:
     try:
         if not url_pattern:
             return {"error": "url_pattern is required for action='install'"}
-        page = await browser_manager.get_active_page()
 
-        if not ignore_csp:
-            csp = await _detect_csp_risk(page)
-            if csp["blocks"]:
-                return {
-                    "status": "refused_csp_blocks_inline",
-                    "reasons": csp["reasons"],
-                    "recommended": "Use hook_jsvmp_interpreter(mode='transparent') or ignore_csp=True",
-                }
+        # v1.0.1: use context.route() instead of page.route() for timing
+        ctx = browser_manager.contexts.get("default")
+        if ctx is None:
+            await browser_manager._ensure_browser()
+            ctx = browser_manager.contexts.get("default")
+        if ctx is None:
+            return {"error": "no browser context available"}
+
+        # Check if page already navigated (timing warning)
+        page_url = None
+        warnings: list[str] = []
+        try:
+            page = await browser_manager.get_active_page()
+            page_url = page.url
+            if page_url and page_url != "about:blank":
+                warnings.append(
+                    "Route registered after page already loaded. Scripts "
+                    "fetched during the initial page load will NOT be "
+                    "intercepted. Call instrumentation(action='reload') "
+                    "to re-trigger page load with this route active, or "
+                    "install BEFORE navigate() next time."
+                )
+        except Exception:
+            pass
 
         cache: dict[str, str] = {}
         stats = {"files_rewritten": 0, "total_edits": 0, "last_url": None,
                  "last_mode_used": None}
+
+        # Build filter sets for selective instrumentation
+        prop_filter_set = set(filter_property_names) if filter_property_names else None
+        obj_filter_set = set(filter_object_names) if filter_object_names else None
 
         async def route_handler(route):
             try:
@@ -178,33 +189,88 @@ async def _install(url_pattern, mode, tag, rewrite_member_access,
                 except UnicodeDecodeError:
                     src = body_bytes.decode("latin-1")
 
+                file_size = len(src.encode("utf-8"))
                 rewritten = src
                 edit_count = 0
                 mode_used = mode
 
-                if mode == "ast":
-                    ast_out, ast_stats = _ast_rewrite_py(
-                        src, tag=tag, rewrite_member_access=rewrite_member_access,
-                        rewrite_calls=rewrite_calls, max_edits=max_rewrites,
-                    )
-                    if ast_out is not None:
-                        rewritten = ast_out
-                        edit_count = ast_stats.get("edits", 0)
-                    elif fallback_on_error:
-                        mode_used = "regex (fallback)"
+                # v1.0.1: large file handling
+                if file_size > max_file_size:
+                    if on_oversized == "skip":
+                        await route.fulfill(
+                            status=resp.status,
+                            headers=dict(resp.headers),
+                            body=src,
+                        )
+                        stats["last_url"] = req_url
+                        stats["last_mode_used"] = "skipped (oversized)"
+                        return
+                    elif on_oversized == "selective":
+                        if not prop_filter_set:
+                            # Can't do selective without filters, pass through
+                            await route.fulfill(
+                                status=resp.status,
+                                headers=dict(resp.headers),
+                                body=src,
+                            )
+                            stats["last_url"] = req_url
+                            stats["last_mode_used"] = "skipped (oversized, no filters)"
+                            return
+                        # Selective: use filtered AST rewrite
+                        ast_out, ast_stats = _ast_rewrite_py(
+                            src, tag=tag,
+                            rewrite_member_access=rewrite_member_access,
+                            rewrite_calls=rewrite_calls,
+                            max_edits=max_rewrites,
+                            filter_property_names=list(prop_filter_set) if prop_filter_set else None,
+                            filter_object_names=list(obj_filter_set) if obj_filter_set else None,
+                        )
+                        if ast_out is not None:
+                            rewritten = ast_out
+                            edit_count = ast_stats.get("edits", 0)
+                            mode_used = "ast (selective)"
+                        elif fallback_on_error:
+                            mode_used = "regex (selective fallback)"
+                            rw, rstats = regex_rewrite(
+                                src, tag=tag,
+                                rewrite_member_access=rewrite_member_access,
+                                max_rewrites=max_rewrites,
+                            )
+                            rewritten = rw
+                            edit_count = rstats.get("member_access_rewrites", 0)
+                    # else "force" — fall through to normal rewrite
+
+                # Normal rewrite (small files or force mode)
+                if rewritten is src:  # not yet rewritten
+                    if mode == "ast":
+                        ast_out, ast_stats = _ast_rewrite_py(
+                            src, tag=tag,
+                            rewrite_member_access=rewrite_member_access,
+                            rewrite_calls=rewrite_calls,
+                            max_edits=max_rewrites,
+                            filter_property_names=list(prop_filter_set) if prop_filter_set else None,
+                            filter_object_names=list(obj_filter_set) if obj_filter_set else None,
+                        )
+                        if ast_out is not None:
+                            rewritten = ast_out
+                            edit_count = ast_stats.get("edits", 0)
+                        elif fallback_on_error:
+                            mode_used = "regex (fallback)"
+                            rw, rstats = regex_rewrite(
+                                src, tag=tag,
+                                rewrite_member_access=rewrite_member_access,
+                                max_rewrites=max_rewrites,
+                            )
+                            rewritten = rw
+                            edit_count = rstats.get("member_access_rewrites", 0)
+                    elif mode == "regex":
                         rw, rstats = regex_rewrite(
-                            src, tag=tag, rewrite_member_access=rewrite_member_access,
+                            src, tag=tag,
+                            rewrite_member_access=rewrite_member_access,
                             max_rewrites=max_rewrites,
                         )
                         rewritten = rw
                         edit_count = rstats.get("member_access_rewrites", 0)
-                elif mode == "regex":
-                    rw, rstats = regex_rewrite(
-                        src, tag=tag, rewrite_member_access=rewrite_member_access,
-                        max_rewrites=max_rewrites,
-                    )
-                    rewritten = rw
-                    edit_count = rstats.get("member_access_rewrites", 0)
 
                 cache[req_url] = rewritten
                 stats["files_rewritten"] += 1
@@ -223,16 +289,24 @@ async def _install(url_pattern, mode, tag, rewrite_member_access,
                 except Exception:
                     pass
 
-        await page.route(url_pattern, route_handler)
+        # v1.0.1: context-level route (catches requests from page load)
+        await ctx.route(url_pattern, route_handler)
         _active_routes[url_pattern] = {
             "handler": route_handler, "cache": cache, "stats": stats,
-            "mode": mode, "tag": tag,
+            "mode": mode, "tag": tag, "context": ctx,
         }
-        return {
+        result = {
             "status": "instrumenting", "pattern": url_pattern,
             "mode": mode, "tag": tag,
-            "note": "Navigate or reload to trigger rewrite.",
+            "route_level": "context",
+            "selective": bool(prop_filter_set or obj_filter_set),
+            "filter_property_names": filter_property_names,
+            "filter_object_names": filter_object_names,
+            "note": "Route active. Navigate or reload to trigger rewrite.",
         }
+        if warnings:
+            result["warnings"] = warnings
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -278,20 +352,31 @@ async def _get_log(tag_filter, type_filter, key_filter, limit, clear) -> dict:
 
 async def _stop(url_pattern) -> dict:
     try:
-        page = await browser_manager.get_active_page()
         removed = []
         if url_pattern is not None:
             if url_pattern in _active_routes:
+                info = _active_routes[url_pattern]
+                ctx = info.get("context")
                 try:
-                    await page.unroute(url_pattern)
+                    if ctx:
+                        await ctx.unroute(url_pattern)
+                    else:
+                        page = await browser_manager.get_active_page()
+                        await page.unroute(url_pattern)
                 except Exception:
                     pass
                 del _active_routes[url_pattern]
                 removed.append(url_pattern)
         else:
             for pat in list(_active_routes.keys()):
+                info = _active_routes[pat]
+                ctx = info.get("context")
                 try:
-                    await page.unroute(pat)
+                    if ctx:
+                        await ctx.unroute(pat)
+                    else:
+                        page = await browser_manager.get_active_page()
+                        await page.unroute(pat)
                 except Exception:
                     pass
                 del _active_routes[pat]
