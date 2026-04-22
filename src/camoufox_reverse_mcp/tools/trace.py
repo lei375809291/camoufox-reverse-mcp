@@ -65,15 +65,8 @@ async def trace_property_access(
     if not _is_trace_enabled():
         return {
             "error": "engine_trace_not_available",
-            "message": (
-                "当前浏览器不支持引擎层 DOM 属性追踪。"
-                "需要安装 camoufox-reverse 定制版浏览器。"
-            ),
-            "install_guide": (
-                "1. 从 https://github.com/WhiteNightShadow/camoufox-reverse/releases 下载对应平台 zip\n"
-                "2. 解压替换到 Camoufox 缓存目录（macOS: ~/Library/Caches/camoufox/）\n"
-                "3. 用 launch_browser(enable_trace=True) 启动"
-            ),
+            "message": "当前浏览器不支持引擎层 DOM 属性追踪，需要安装 camoufox-reverse 定制版浏览器。",
+            "install_guide": "https://github.com/WhiteNightShadow/camoufox-reverse/releases",
         }
 
     # Clean old traces
