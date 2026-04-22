@@ -63,10 +63,18 @@ async def trace_property_access(
         fallback: {mode: "fallback_compare_env", reason, result}
     """
     if not _is_trace_enabled():
-        return await _fallback_compare_env(
-            "PropertyTracer not active. Launch browser with enable_trace=True, "
-            "or install camoufox-reverse custom browser."
-        )
+        return {
+            "error": "engine_trace_not_available",
+            "message": (
+                "当前浏览器不支持引擎层 DOM 属性追踪。"
+                "需要安装 camoufox-reverse 定制版浏览器。"
+            ),
+            "install_guide": (
+                "1. 从 https://github.com/WhiteNightShadow/camoufox-reverse/releases 下载对应平台 zip\n"
+                "2. 解压替换到 Camoufox 缓存目录（macOS: ~/Library/Caches/camoufox/）\n"
+                "3. 用 launch_browser(enable_trace=True) 启动"
+            ),
+        }
 
     # Clean old traces
     cleanup_traces()
