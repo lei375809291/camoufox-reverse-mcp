@@ -33,6 +33,7 @@ async def trace_property_access(
     search_query: Optional[str] = None,
     limit: int = 1000,
     bucket_ms: int = 500,
+    collect_values: bool = False,
 ) -> dict:
     """Engine-level DOM property access tracing (JSVMP-undetectable).
 
@@ -57,12 +58,16 @@ async def trace_property_access(
         search_query: Only include events matching this string in property/value.
         limit: Max events for sequence/search mode (default 1000).
         bucket_ms: Bucket size for timeline mode (default 500ms).
+        collect_values: If True, after trace completes, use evaluate_js to read
+            real values of all traced properties from the browser. Large values
+            (Canvas dataURL, WebGL params etc.) are saved to files under
+            ~/.cache/camoufox-reverse/values/ and returned as file paths.
 
     Returns:
         summary mode: {mode, duration_s, total_events, unique_properties, by_property, by_object}
+            If collect_values=True, adds "values" dict: {property_path: value_or_filepath}
         timeline mode: {mode, duration_s, bucket_ms, buckets}
         sequence mode: {mode, total_events, returned, truncated, events}
-        fallback: {mode: "fallback_compare_env", reason, result}
     """
     if not _is_trace_enabled():
         return {
@@ -103,13 +108,20 @@ async def trace_property_access(
 
     # Aggregate
     if mode == "summary":
-        return build_summary(events, duration)
+        result = build_summary(events, duration)
     elif mode == "timeline":
-        return build_timeline(events, duration, bucket_ms)
+        result = build_timeline(events, duration, bucket_ms)
     elif mode in ("sequence", "search"):
-        return build_sequence(events, limit)
+        result = build_sequence(events, limit)
     else:
         return {"mode": "error", "reason": f"Unknown mode: {mode}"}
+
+    # Collect real values from browser
+    if collect_values and result.get("by_property"):
+        values = await _collect_property_values(result["by_property"])
+        result["values"] = values
+
+    return result
 
 
 @mcp.tool()
@@ -187,6 +199,104 @@ async def query_trace_file(
         return build_sequence(events, limit)
     else:
         return {"mode": "error", "reason": f"Unknown mode: {mode}"}
+
+
+async def _collect_property_values(by_property: list[dict]) -> dict:
+    """Read real values of traced properties from the browser via evaluate_js.
+    Large values (>500 chars) are saved to files."""
+    import json as _json
+    from ..property_trace import CACHE_DIR
+
+    values_dir = CACHE_DIR / "values"
+    values_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build JS expression to read all unique properties
+    # Map trace paths to JS expressions
+    path_to_js = {
+        "navigator.userAgent": "navigator.userAgent",
+        "navigator.platform": "navigator.platform",
+        "navigator.language": "navigator.language",
+        "navigator.languages": "JSON.stringify(navigator.languages)",
+        "navigator.hardwareConcurrency": "navigator.hardwareConcurrency",
+        "navigator.maxTouchPoints": "navigator.maxTouchPoints",
+        "navigator.cookieEnabled": "navigator.cookieEnabled",
+        "navigator.onLine": "navigator.onLine",
+        "navigator.pdfViewerEnabled": "navigator.pdfViewerEnabled",
+        "navigator.doNotTrack": "navigator.doNotTrack",
+        "navigator.appVersion": "navigator.appVersion",
+        "navigator.appCodeName": "navigator.appCodeName",
+        "navigator.appName": "navigator.appName",
+        "navigator.product": "navigator.product",
+        "navigator.productSub": "navigator.productSub",
+        "navigator.oscpu": "navigator.oscpu",
+        "navigator.buildID": "navigator.buildID",
+        "navigator.globalPrivacyControl": "navigator.globalPrivacyControl",
+        "screen.rect": "JSON.stringify({w:screen.width,h:screen.height})",
+        "screen.availRect": "JSON.stringify({w:screen.availWidth,h:screen.availHeight,l:screen.availLeft,t:screen.availTop})",
+        "screen.pixelDepth": "screen.pixelDepth",
+        "screen.colorDepth": "screen.colorDepth",
+        "window.innerWidth": "window.innerWidth",
+        "window.innerHeight": "window.innerHeight",
+        "window.outerWidth": "window.outerWidth",
+        "window.outerHeight": "window.outerHeight",
+        "window.screenX": "window.screenX",
+        "window.screenY": "window.screenY",
+        "window.devicePixelRatio": "window.devicePixelRatio",
+        "window.scrollX": "window.scrollX",
+        "window.scrollY": "window.scrollY",
+        "document.cookie.get": "document.cookie",
+        "history.length": "history.length",
+        "navigator.plugins.indexedGetter": "navigator.plugins.length",
+        "navigator.mimeTypes.indexedGetter": "navigator.mimeTypes.length",
+        "performance.timing": "JSON.stringify(performance.timing)",
+        "canvas.toDataURL": "(()=>{var c=document.createElement('canvas');c.width=200;c.height=50;var x=c.getContext('2d');x.fillText('trace',10,30);return c.toDataURL()})()",
+        "canvas2d.getImageData": "(()=>{var c=document.createElement('canvas');c.width=10;c.height=10;var x=c.getContext('2d');x.fillRect(0,0,5,5);return JSON.stringify(Array.from(x.getImageData(0,0,1,1).data))})()",
+        "webgl.getParameter": "(()=>{var c=document.createElement('canvas');var g=c.getContext('webgl');if(!g)return null;return JSON.stringify({renderer:g.getParameter(g.RENDERER),vendor:g.getParameter(g.VENDOR)})})()",
+        "webgl.getSupportedExtensions": "(()=>{var c=document.createElement('canvas');var g=c.getContext('webgl');if(!g)return null;return JSON.stringify(g.getSupportedExtensions())})()",
+        "webgl.getShaderPrecisionFormat": "(()=>{var c=document.createElement('canvas');var g=c.getContext('webgl');if(!g)return null;var p=g.getShaderPrecisionFormat(g.VERTEX_SHADER,g.HIGH_FLOAT);return JSON.stringify({rangeMin:p.rangeMin,rangeMax:p.rangeMax,precision:p.precision})})()",
+        "AudioContext.sampleRate": "(()=>{try{var a=new AudioContext();var r=a.sampleRate;a.close();return r}catch(e){return null}})()",
+    }
+
+    # Get unique property paths from trace
+    paths = [p["path"] for p in by_property]
+
+    # Build batch JS
+    js_parts = []
+    for path in paths:
+        js_expr = path_to_js.get(path)
+        if js_expr:
+            safe_key = path.replace(".", "_").replace("-", "_")
+            js_parts.append(f'try{{r.{safe_key}={js_expr}}}catch(e){{r.{safe_key}="ERROR:"+e.message}}')
+
+    if not js_parts:
+        return {}
+
+    js_code = "(() => { var r = {}; " + ";".join(js_parts) + "; return r; })()"
+
+    try:
+        page = await browser_manager.get_active_page()
+        raw = await page.evaluate(js_code)
+    except Exception as e:
+        return {"error": f"evaluate_js failed: {e}"}
+
+    # Process results: save large values to files
+    values = {}
+    for path in paths:
+        safe_key = path.replace(".", "_").replace("-", "_")
+        val = raw.get(safe_key)
+        if val is None:
+            continue
+        val_str = str(val)
+        if len(val_str) > 500:
+            # Save to file
+            filename = f"{safe_key}.txt"
+            filepath = values_dir / filename
+            filepath.write_text(val_str, encoding="utf-8")
+            values[path] = f"[file:{filepath}] ({len(val_str)} chars)"
+        else:
+            values[path] = val
+
+    return values
 
 
 async def _fallback_compare_env(reason: str) -> dict:
