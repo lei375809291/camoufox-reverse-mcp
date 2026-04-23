@@ -241,7 +241,10 @@ async def reload(wait_until: str = "load") -> dict:
     """Reload the current page, preserving any init scripts."""
     try:
         page = await browser_manager.get_active_page()
-        await page.reload(wait_until=wait_until)
+        current_url = page.url
+        if not current_url or current_url == "about:blank":
+            return {"error": "No page loaded to reload"}
+        await page.goto(current_url, wait_until=wait_until)
         return {"url": page.url, "title": await page.title()}
     except Exception as e:
         return {"error": str(e)}
