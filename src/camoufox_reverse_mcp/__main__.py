@@ -1,4 +1,14 @@
 import argparse
+
+# CRITICAL: import camoufox BEFORE entering asyncio event loop.
+# camoufox/__init__.py imports playwright.sync_api at top level.
+# If that import happens inside a running asyncio loop (e.g. when
+# launch_browser lazily triggers `from camoufox.async_api import ...`),
+# Playwright's sync bootstrap deadlocks for 60s+.
+# Pre-importing here ensures the module is cached in sys.modules
+# before FastMCP starts its event loop.
+import camoufox  # noqa: F401
+
 from .server import mcp
 
 
