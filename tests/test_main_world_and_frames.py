@@ -629,10 +629,14 @@ class NodeWorldTarget:
               .on('line', async line => {
                 try {
                   let source = JSON.parse(line);
-                  if (source.startsWith('mw:')) source = source.slice(3);
+                  const native = source.startsWith('mw:');
+                  if (native) source = source.slice(3);
                   source = source.trim().replace(/;\s*$/, '');
                   let value = eval('(' + source + ')');
                   if (typeof value === 'function') value = value();
+                  if (native && window.__drop_native_promises && value && typeof value.then === 'function') {
+                    value = null;
+                  }
                   value = await value;
                   process.stdout.write(JSON.stringify({value}) + '\n');
                 } catch (error) {
@@ -669,6 +673,19 @@ def node_world_target():
         yield target
     finally:
         target.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_only_native_bridge_falls_back_before_caller_execution(node_world_target):
+    target = node_world_target
+    await target.evaluate("() => { window.__drop_native_promises = true; window.calls = 0; }")
+    value, backend, warning = await evaluate_in_world(
+        target, "() => { window.calls++; return 42; }", "main"
+    )
+    assert value == 42
+    assert backend == "wrappedJSObject"
+    assert "fallback" in warning
+    assert await target.evaluate("() => window.calls") == 1
 
 
 @pytest.mark.asyncio

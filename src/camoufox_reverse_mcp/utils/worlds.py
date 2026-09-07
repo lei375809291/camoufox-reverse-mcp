@@ -58,7 +58,11 @@ async def evaluate_in_world(
     # another channel can repeat side effects (including page getters and calls
     # that navigated away before Playwright received their result).
     try:
-        probe = await target.evaluate("mw:() => ({__mcp_native_ok: true})")
+        # Match the real payload's Promise contract. Some older mw: bridges
+        # return synchronous values but drop Promise results.
+        probe = await target.evaluate(
+            "mw:() => (async () => ({__mcp_native_ok: true, value: await Promise.resolve(null)}))()"
+        )
         if not isinstance(probe, dict) or probe.get("__mcp_native_ok") is not True:
             raise RuntimeError("Camoufox main-world channel returned no probe sentinel")
     except Exception as native_error:

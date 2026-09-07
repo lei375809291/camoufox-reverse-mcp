@@ -313,6 +313,11 @@ trace_property_access(action="stop", mode="summary")
 
 ## Changelog
 
+### v1.5.2 (2026-09-07) — Legacy Main-World Channel Compatibility
+
+- Probe the same Promise-returning contract used by real calls, detecting synchronous-only bridges
+- Select the wrappedJSObject fallback before executing caller code, without replaying failed calls
+
 ### v1.5.1 (2026-09-07) — Trace Clearing and Hook Lifecycle Fixes
 
 - Preserve target function behavior after clearing Trace data
