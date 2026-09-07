@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+import asyncio
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+from ..utils.domains import domain_matches
 
 from ..server import mcp, browser_manager
 
@@ -11,6 +16,8 @@ async def network_capture(
     action: str,
     url_pattern: str = "**/*",
     capture_body: bool = False,
+    max_body_size: int = 200000,
+    wait_timeout_ms: int = 0,
 ) -> dict:
     """Unified network capture control (v0.9.0).
 
@@ -24,11 +31,21 @@ async def network_capture(
           "status" — return current capture state
         url_pattern: Glob pattern for "start" (default "**/*" captures all).
         capture_body: For "start" only; capture response bodies (more memory).
+        max_body_size: For start; retained characters per response, 0..2000000.
+            Playwright still reads the complete response before truncation.
+        wait_timeout_ms: For stop; wait up to 30000ms for captured responses.
+            New requests stop immediately; unfinished work is reported, not replayed.
+            Clear cancels pending work; IDs remain monotonic until browser close.
 
     Returns:
         dict with action result + current status snapshot.
     """
+    if not 0 <= wait_timeout_ms <= 30000:
+        return {"error": "wait_timeout_ms must be between 0 and 30000"}
     if action == "start":
+        if not 0 <= max_body_size <= 2_000_000:
+            return {"error": "max_body_size must be between 0 and 2000000"}
+        browser_manager._capture_body_limit = max_body_size
         browser_manager._capturing = True
         browser_manager._capture_pattern = url_pattern
         browser_manager._capture_body = capture_body
@@ -36,20 +53,20 @@ async def network_capture(
                 "capture_body": capture_body}
     elif action == "stop":
         browser_manager._capturing = False
+        deadline = asyncio.get_running_loop().time() + wait_timeout_ms / 1000
+        while (browser_manager._request_entries or browser_manager._capture_tasks):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.02, remaining))
         return {"status": "stopped",
-                "total_requests": len(browser_manager._network_requests)}
+                "total_requests": len(browser_manager._network_requests),
+                **browser_manager.capture_status()}
     elif action == "clear":
-        count = len(browser_manager._network_requests)
-        browser_manager._network_requests.clear()
-        browser_manager._request_id_counter = 0
+        count = browser_manager.clear_network_capture()
         return {"status": "cleared", "cleared_count": count}
     elif action == "status":
-        return {
-            "active": browser_manager._capturing,
-            "pattern": browser_manager._capture_pattern,
-            "capture_body": browser_manager._capture_body,
-            "buffer_size": len(browser_manager._network_requests),
-        }
+        return browser_manager.capture_status()
     else:
         return {"error": f"unknown action: {action}. Use start/stop/clear/status"}
 
@@ -61,25 +78,36 @@ async def list_network_requests(
     method: str | None = None,
     resource_type: str | None = None,
     status_code: int | None = None,
+    limit: int | None = None,
+    after_id: int | None = None,
 ) -> list[dict]:
     """List captured network requests with optional filters.
 
     Args:
         url_filter: Substring filter for request URLs.
-        url_contains_domain: Convenience domain filter (e.g. 'nmpa.gov.cn').
+        url_contains_domain: Host/subdomain boundary filter (e.g. "example.com").
         method: HTTP method filter (e.g. "GET", "POST").
         resource_type: Resource type filter (e.g. "xhr", "fetch", "script", "document").
         status_code: HTTP status code filter.
+        limit: Optional page size (1..2000); omitted preserves the full list.
+        after_id: Return IDs greater than this cursor, in capture order.
+            Check network_capture(status).dropped_requests for lost history.
 
     Returns:
         List of request summaries with id, url, method, status, type, ms, size.
     """
     try:
+        if limit is not None and not 1 <= limit <= 2000:
+            return [{"error": "limit must be between 1 and 2000"}]
+        if after_id is not None and after_id < 0:
+            return [{"error": "after_id must be non-negative"}]
         reqs = list(browser_manager._network_requests)
+        if after_id is not None:
+            reqs = [r for r in reqs if r["id"] > after_id]
         if url_filter:
             reqs = [r for r in reqs if url_filter in r["url"]]
         if url_contains_domain:
-            reqs = [r for r in reqs if url_contains_domain in r.get("url", "")]
+            reqs = [r for r in reqs if domain_matches(urlsplit(r["url"]).hostname or "", url_contains_domain)]
         if method:
             reqs = [r for r in reqs if r["method"].upper() == method.upper()]
         if resource_type:
@@ -87,6 +115,8 @@ async def list_network_requests(
         if status_code is not None:
             reqs = [r for r in reqs if r.get("status") == status_code]
 
+        if limit is not None:
+            reqs = reqs[:limit]
         summaries = []
         for r in reqs:
             body_size = len(r["response_body"]) if r.get("response_body") else 0
@@ -94,7 +124,10 @@ async def list_network_requests(
                 "id": r["id"], "url": r["url"][:200], "method": r["method"],
                 "status": r.get("status"), "type": r.get("resource_type"),
                 "ms": r.get("duration"), "size": body_size,
-                "has_body": body_size > 0,
+                "has_body": r.get("response_body") is not None,
+                "state": r.get("state"), "body_state": r.get("body_state"),
+                "failure": r.get("failure"),
+                "body_truncated": r.get("response_body_capture_truncated", False),
             })
         return summaries
     except Exception as e:
@@ -130,15 +163,20 @@ async def get_network_request(
                         result["response_body_size"] = len(body)
                 else:
                     body = result.get("response_body")
-                    if body is not None and max_body_size >= 0 and len(body) > max_body_size:
-                        result["response_body"] = body[:max_body_size]
-                        result["response_body_truncated"] = True
-                        result["response_body_original_size"] = len(body)
-                        result["response_body_size_returned"] = max_body_size
-                    elif body is not None:
-                        result["response_body_truncated"] = False
-                        result["response_body_original_size"] = len(body)
-                        result["response_body_size_returned"] = len(body)
+                    if body is not None:
+                        capture_truncated = bool(r.get("response_body_capture_truncated",
+                                                       r.get("response_body_truncated", False)))
+                        return_truncated = max_body_size >= 0 and len(body) > max_body_size
+                        returned = body[:max_body_size] if return_truncated else body
+                        result.update(
+                            response_body=returned,
+                            response_body_truncated=capture_truncated or return_truncated,
+                            response_body_capture_truncated=capture_truncated,
+                            response_body_return_truncated=return_truncated,
+                            response_body_original_size=r.get("response_body_total_size", len(body)),
+                            response_body_stored_size=len(body),
+                            response_body_size_returned=len(returned),
+                        )
                 if not include_headers:
                     result.pop("request_headers", None)
                     result.pop("response_headers", None)
@@ -328,3 +366,70 @@ async def intercept_request(
         return {"status": "intercepting", "pattern": url_pattern, "action": action}
     except Exception as e:
         return {"error": str(e)}
+
+
+@mcp.tool()
+async def export_network_capture(
+    save_path: str,
+    include_body: bool = False,
+    include_sensitive: bool = False,
+    url_filter: str | None = None,
+) -> dict:
+    """Export a versioned JSON snapshot of this manager's retained capture.
+
+    Args:
+        save_path: New local JSON path; existing files are never overwritten.
+        include_body: Include captured request/response bodies only together
+            with include_sensitive=True. Does not fetch or replay requests.
+        include_sensitive: Opt in to original headers, query values and bodies.
+            Default masks all header/query values, removes URL credentials and
+            fragments, and omits bodies. URL paths are retained: this is not full
+            anonymization. Keep original captures out of public repositories.
+        url_filter: Optional URL substring filter.
+
+    Returns:
+        Path, count, redaction mode and capture status including pending/dropped
+        work. For a settled snapshot call network_capture(stop, wait_timeout_ms).
+    """
+    try:
+        if include_body and not include_sensitive:
+            return {"error": "include_body requires include_sensitive=True"}
+        rows = []
+        for entry in browser_manager._network_requests:
+            if url_filter and url_filter not in entry["url"]:
+                continue
+            row = dict(entry)
+            if not include_body:
+                row.pop("request_post_data", None)
+                row.pop("response_body", None)
+            if not include_sensitive:
+                parts = urlsplit(row["url"])
+                row["url"] = urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1],
+                    parts.path, urlencode([(key, "[REDACTED]") for key, _ in
+                                            parse_qsl(parts.query, keep_blank_values=True)]), ""))
+                for field in ("request_headers", "response_headers"):
+                    row[field] = {key: "[REDACTED]" for key in (row.get(field) or {})}
+                # Transport error strings can contain original URLs.
+                for field in ("failure", "headers_error", "body_error"):
+                    if row.get(field):
+                        row[field] = "[REDACTED]"
+            rows.append(row)
+        from .. import __version__
+        status = browser_manager.capture_status()
+        payload = {"schema_version": 1, "mcp_version": __version__,
+                   "exported_at": int(time.time() * 1000),
+                   "include_sensitive": include_sensitive, "include_body": include_body,
+                   "capture": status, "requests": rows}
+        if not include_sensitive:
+            payload["capture"] = {**status, "pattern": "[REDACTED]"}
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+        path = Path(save_path).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Exclusive create prevents accidentally destroying another capture.
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(encoded)
+        return {"status": "exported", "path": str(path), "count": len(rows),
+                "schema_version": 1, "redacted": not include_sensitive,
+                "capture": payload["capture"]}
+    except Exception as exc:
+        return {"error": str(exc)}

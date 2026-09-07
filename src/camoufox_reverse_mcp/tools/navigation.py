@@ -169,8 +169,7 @@ async def navigate(
             try:
                 cleared_count = len(browser_manager._network_requests)
                 if cleared_count > 0:
-                    browser_manager._network_requests.clear()
-                    browser_manager._request_id_counter = 0
+                    browser_manager.clear_network_capture()
                     warnings.append(f"cleared {cleared_count} stale network requests")
             except Exception:
                 pass
@@ -456,8 +455,7 @@ async def _reset_browser_state_impl(
                 result["hooks_remove_error"] = str(e)
         if clear_network_capture:
             count = len(browser_manager._network_requests)
-            browser_manager._network_requests.clear()
-            browser_manager._request_id_counter = 0
+            browser_manager.clear_network_capture()
             browser_manager._capturing = False
             browser_manager._capture_body = False
             result["network_requests_cleared"] = count

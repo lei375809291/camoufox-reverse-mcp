@@ -25,6 +25,15 @@
 
 ---
 
+## v1.6.0：通用采集与独立验签
+
+- 同 URL 并发响应按 Request 对象关联，完整采集 Cookie/Set-Cookie，并明确失败、淘汰、未完成任务和截断状态。
+- `list_network_requests(limit=100, after_id=0)` 增量读取；`export_network_capture` 导出有版本号的 JSON，默认掩码，保留旧调用方式。
+- `verify_signer_offline(..., runtime="node")` 可不启动浏览器验证独立签名函数；默认 browser 路径不变，无有效期望值的样本不会再误通过。
+- Cookie 组合过滤只删除同时匹配的条目，老运行库通过逐条过期兼容；导出不会覆盖旧文件，采集清理不会复用旧请求 ID。
+
+详细行为、限制与示例见 [通用采集契约](docs/GENERAL_COLLECTION.md) 和 [v1.6.0 版本说明](docs/releases/v1.6.0.md)。
+
 ## 快速开始
 
 ### 方式一：AI 对话框直接安装（推荐）

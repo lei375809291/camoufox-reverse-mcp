@@ -25,6 +25,15 @@ An MCP (Model Context Protocol) server that gives AI coding assistants (Claude C
 
 ---
 
+## v1.6.0: General Capture and Standalone Verification
+
+- Associate concurrent responses by Request identity, collect full cookie headers, and report failures, eviction, pending work and truncation explicitly.
+- Optional `limit`/`after_id` pagination and `export_network_capture` JSON snapshots; existing list calls remain compatible. Export masks header/query values and omits bodies by default.
+- Optional `verify_signer_offline(..., runtime="node")` uses an independent Node.js process. The browser runtime remains the default; empty assertions and missing keys no longer pass.
+- Cookie name/domain filters now intersect. Older Playwright versions expire only selected cookies. Capture IDs remain monotonic until browser close.
+
+See the [collection contract](docs/GENERAL_COLLECTION.md) and [Chinese release notes](docs/releases/v1.6.0.md) for limits, examples and validation.
+
 ## Quick Start
 
 ### Option 1: Install via AI Chat (Recommended)

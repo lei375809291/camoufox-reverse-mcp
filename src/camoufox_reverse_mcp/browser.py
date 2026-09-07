@@ -11,6 +11,7 @@ from playwright.async_api import BrowserContext, Page
 
 MAX_LOG_SIZE = 2000
 MAX_BODY_SIZE = 200_000
+MAX_CAPTURE_TASKS = 32
 MAX_TRACE_PATHS = 128
 MAX_TRACE_EVENTS = 2000
 MAX_TRACE_MESSAGE_SIZE = 32_000
@@ -56,6 +57,10 @@ class BrowserManager:
         self._capturing = False
         self._capture_pattern: str = "**/*"
         self._capture_body = False
+        self._capture_body_limit = MAX_BODY_SIZE
+        self._request_entries: dict[int, tuple[Any, dict]] = {}
+        self._capture_tasks: dict[int, asyncio.Task] = {}
+        self._capture_dropped = 0
         self._init_scripts: list[str] = []
         self._persistent_scripts: list[dict] = []
         self._retired_hook_scripts = False
@@ -397,6 +402,7 @@ class BrowserManager:
         page.on("request", self._on_request)
         page.on("response", self._on_response_async)
         page.on("response", self._on_response_for_nav)
+        page.on("requestfailed", self._on_request_failed)
 
     def _on_console(self, msg) -> None:
         text = msg.text
@@ -449,57 +455,142 @@ class BrowserManager:
             "location": str(msg.location) if hasattr(msg, "location") else None,
         })
 
+    def clear_network_capture(self) -> int:
+        """Clear only this manager's capture and cancel its outstanding work.
+
+        IDs remain monotonic until close, so an old cursor cannot match a new
+        request after clear/reset/navigation.
+        """
+        count = len(self._network_requests)
+        for task in self._capture_tasks.values():
+            task.cancel()
+        self._capture_tasks.clear()
+        self._request_entries.clear()
+        self._network_requests.clear()
+        self._capture_dropped = 0
+        return count
+
+    def capture_status(self) -> dict:
+        return {
+            "active": self._capturing,
+            "pattern": self._capture_pattern,
+            "capture_body": self._capture_body,
+            "max_body_size": self._capture_body_limit,
+            "buffer_size": len(self._network_requests),
+            "max_requests": self._network_requests.maxlen,
+            "dropped_requests": self._capture_dropped,
+            "pending_requests": len(self._request_entries),
+            "pending_responses": len(self._capture_tasks),
+            "first_request_id": self._network_requests[0]["id"] if self._network_requests else None,
+            "last_request_id": self._request_id_counter,
+        }
+
     def _on_request(self, req) -> None:
         if not self._capturing:
             return
         import fnmatch
-        if not fnmatch.fnmatch(req.url, self._capture_pattern):
+        if not fnmatch.fnmatchcase(req.url, self._capture_pattern):
             return
         self._request_id_counter += 1
+        try:
+            post_data = req.post_data
+        except Exception:
+            post_data = None
         entry = {
             "id": self._request_id_counter,
             "url": req.url,
             "method": req.method,
             "resource_type": req.resource_type,
             "request_headers": dict(req.headers),
-            "request_post_data": req.post_data,
+            "request_post_data": post_data,
             "timestamp": int(time.time() * 1000),
             "status": None,
             "response_headers": None,
             "response_body": None,
             "duration": None,
+            "state": "pending",
+            "headers_complete": False,
+            "capture_body_limit": self._capture_body_limit,
+            "body_state": "pending" if self._capture_body else "not_captured",
         }
+        if len(self._network_requests) == self._network_requests.maxlen:
+            evicted = self._network_requests[0]
+            for key, (_, pending) in list(self._request_entries.items()):
+                if pending is evicted:
+                    self._request_entries.pop(key, None)
+                    break
+            task = self._capture_tasks.pop(evicted["id"], None)
+            if task:
+                task.cancel()
+            self._capture_dropped += 1
         self._network_requests.append(entry)
+        # Retain the Request object until completion/eviction to prevent id reuse.
+        self._request_entries[id(req)] = (req, entry)
+
+    def _take_request_entry(self, req) -> dict | None:
+        saved = self._request_entries.pop(id(req), None)
+        return saved[1] if saved and saved[0] is req else None
+
+    def _on_request_failed(self, req) -> None:
+        entry = self._take_request_entry(req)
+        if entry is not None:
+            entry.update(state="failed", failure=req.failure,
+                         body_state="failed",
+                         duration=int(time.time() * 1000) - entry["timestamp"])
 
     def _on_response_async(self, resp) -> None:
-        """Handle response events, optionally capturing body asynchronously."""
-        if not self._capturing:
+        # Stop prevents new captures, but already captured requests still finish.
+        entry = self._take_request_entry(resp.request)
+        if entry is None:
             return
-        for entry in reversed(self._network_requests):
-            if entry["url"] == resp.url and entry["status"] is None:
-                entry["status"] = resp.status
-                entry["response_headers"] = dict(resp.headers)
-                entry["duration"] = int(time.time() * 1000) - entry["timestamp"]
-                if self._capture_body:
-                    asyncio.ensure_future(self._fetch_response_body(resp, entry))
-                break
+        entry.update(status=resp.status, response_headers=dict(resp.headers),
+                     state="responded",
+                     duration=int(time.time() * 1000) - entry["timestamp"])
+        if len(self._capture_tasks) >= MAX_CAPTURE_TASKS:
+            entry["capture_warning"] = "response_capture_capacity_reached"
+            if entry["body_state"] == "pending":
+                entry["body_state"] = "skipped_capacity"
+            return
+        task = asyncio.create_task(self._complete_response(resp, entry, entry["capture_body_limit"]))
+        self._capture_tasks[entry["id"]] = task
+        def done(completed):
+            if self._capture_tasks.get(entry["id"]) is completed:
+                self._capture_tasks.pop(entry["id"], None)
+        task.add_done_callback(done)
 
-    async def _fetch_response_body(self, resp, entry: dict) -> None:
-        """Asynchronously fetch and store the response body."""
+    async def _complete_response(self, resp, entry: dict, body_limit: int) -> None:
+        try:
+            # The synchronous headers properties omit Cookie/Set-Cookie.
+            entry["request_headers"] = await resp.request.all_headers()
+            entry["response_headers"] = await resp.all_headers()
+            entry["headers_complete"] = True
+        except Exception as exc:
+            entry["headers_error"] = str(exc)
+        if entry["body_state"] == "pending":
+            await self._fetch_response_body(resp, entry, body_limit)
+
+    async def _fetch_response_body(self, resp, entry: dict, limit: int | None = None) -> None:
+        """Retain bounded text; record source, stored and returned sizes separately."""
         try:
             body_bytes = await resp.body()
             try:
                 body_text = body_bytes.decode("utf-8")
             except UnicodeDecodeError:
                 body_text = body_bytes.decode("latin-1")
-            if len(body_text) > MAX_BODY_SIZE:
-                entry["response_body"] = body_text[:MAX_BODY_SIZE]
-                entry["response_body_truncated"] = True
-                entry["response_body_total_size"] = len(body_text)
-            else:
-                entry["response_body"] = body_text
-        except Exception:
-            entry["response_body"] = None
+            limit = self._capture_body_limit if limit is None else limit
+            truncated = len(body_text) > limit
+            entry.update(
+                response_body=body_text[:limit],
+                response_body_truncated=truncated,
+                response_body_capture_truncated=truncated,
+                response_body_total_size=len(body_text),
+                response_body_original_size=len(body_text),
+                response_body_stored_size=min(len(body_text), limit),
+                response_body_total_bytes=len(body_bytes),
+                body_state="truncated" if truncated else "complete",
+            )
+        except Exception as exc:
+            entry.update(response_body=None, body_state="failed", body_error=str(exc))
 
     def _on_response_for_nav(self, resp) -> None:
         """Record every response during a navigation for final_status resolution."""
@@ -548,6 +639,8 @@ class BrowserManager:
         Attach mode (connected to an external server): only disconnects the local
         Playwright client — the user's browser and server are left running.
         """
+        self._capturing = False
+        self.clear_network_capture()
         owned_context_closed = False
         trace_base_dir = self._trace_base_dir
         if trace_base_dir is not None:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import json
+import re
+import inspect
 import os
 
 from ..server import mcp, browser_manager
+from ..utils.domains import domain_matches
 
 
 @mcp.tool()
@@ -22,7 +24,8 @@ async def cookies(
           "get"   — return cookies (optionally filtered by domain)
           "set"   — set cookies (requires cookies_list: [{name, value, domain, ...}])
           "delete" — delete cookies (filter by name and/or domain; no filter = clear all)
-        domain: Domain filter for "get" and "delete" (e.g. ".example.com").
+        domain: Host or parent domain for get/delete (boundary match, includes subdomains).
+            With name, both filters must match. No filters deletes all cookies.
         cookies_list: List of cookie dicts for "set".
         name: Cookie name filter for "delete".
 
@@ -37,7 +40,7 @@ async def cookies(
         if action == "get":
             all_cookies = await ctx.cookies()
             if domain:
-                all_cookies = [c for c in all_cookies if domain in c.get("domain", "")]
+                all_cookies = [c for c in all_cookies if domain_matches(c.get("domain", ""), domain)]
             return all_cookies
 
         elif action == "set":
@@ -48,24 +51,28 @@ async def cookies(
 
         elif action == "delete":
             all_cookies = await ctx.cookies()
-            to_keep = []
-            deleted = 0
-            for c in all_cookies:
-                should_delete = False
-                if name and c["name"] == name:
-                    should_delete = True
-                if domain and domain in c.get("domain", ""):
-                    should_delete = True
-                if not name and not domain:
-                    should_delete = True
-                if should_delete:
-                    deleted += 1
-                else:
-                    to_keep.append(c)
-            await ctx.clear_cookies()
-            if to_keep:
-                await ctx.add_cookies(to_keep)
-            return {"status": "deleted", "count": deleted}
+            selected = [c for c in all_cookies
+                        if (not name or c["name"] == name)
+                        and (not domain or domain_matches(c.get("domain", ""), domain))]
+            if not name and not domain:
+                await ctx.clear_cookies()
+            else:
+                # Filtering was added in Playwright 1.43. Older installations
+                # expire only the selected cookies, never clear/rebuild the jar.
+                params = inspect.signature(ctx.clear_cookies).parameters
+                supports_filters = all(key in params for key in ("name", "domain", "path")) or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                for c in selected:
+                    if supports_filters:
+                        await ctx.clear_cookies(
+                            name=re.compile("^" + re.escape(c["name"]) + "$"),
+                            domain=re.compile("^" + re.escape(c["domain"]) + "$"),
+                            path=re.compile("^" + re.escape(c.get("path", "/")) + "$"),
+                        )
+                    else:
+                        await ctx.add_cookies([{**c, "expires": 1}])
+
+            return {"status": "deleted", "count": len(selected)}
 
         else:
             return {"error": f"unknown action: {action}. Use get/set/delete"}
@@ -145,6 +152,8 @@ async def import_state(state_path: str) -> dict:
         ctx = await browser_manager.browser.new_context(storage_state=state_path)
         ctx_name = f"imported_{len(browser_manager.contexts)}"
         browser_manager.contexts[ctx_name] = ctx
+        for script in browser_manager._persistent_scripts:
+            await ctx.add_init_script(script=script["content"])
         page = await ctx.new_page()
         browser_manager._attach_listeners(page)
         browser_manager.pages[ctx_name] = page

@@ -72,6 +72,11 @@ jobs:
           if not any("\u4e00" <= char <= "\u9fff" for char in text):
               raise SystemExit("release notes must contain Chinese text")
           PY
+          tag_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+          if [[ "$tag_commit" != "${{ github.event.workflow_run.head_sha }}" ]]; then
+            echo "Tag ${tag} does not point to the successful CI commit." >&2
+            exit 1
+          fi
           cp "$notes_source" "$notes_file"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" \
@@ -81,11 +86,6 @@ jobs:
             echo "Release ${tag} notes updated from ${notes_file}."
             echo "publish=false" >> "$GITHUB_OUTPUT"
             exit 0
-          fi
-          tag_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
-          if [[ "$tag_commit" != "${{ github.event.workflow_run.head_sha }}" ]]; then
-            echo "Tag ${tag} does not point to the successful CI commit." >&2
-            exit 1
           fi
           echo "publish=true" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
