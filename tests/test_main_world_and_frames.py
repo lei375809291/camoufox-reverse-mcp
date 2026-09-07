@@ -19,6 +19,7 @@ from camoufox_reverse_mcp.tools.hooking import (
     _build_installer_core,
     get_trace_data,
     hook_function,
+    remove_hooks,
 )
 from camoufox_reverse_mcp.tools.navigation import get_page_info
 from camoufox_reverse_mcp.utils.frames import list_frame_metadata, resolve_frame
@@ -495,11 +496,15 @@ async def test_clear_without_selector_clears_every_current_frame_and_cache():
     main = FakeFrame("https://host.test/")
     child = FakeFrame("https://child.test/", "child", main)
     main.evaluate.side_effect = [
+        {"__mcp_native_ok": True},
         {"__mcp_native_ok": True, "value": {"window.fn": [{"traceId": "main", "world": "main", "frame": {"url": main.url, "name": "", "index": 0, "is_main": True}}]}},
+        {"__mcp_native_ok": True},
         {"__mcp_native_ok": True, "value": None},
     ]
     child.evaluate.side_effect = [
+        {"__mcp_native_ok": True},
         {"__mcp_native_ok": True, "value": {"window.fn": [{"traceId": "child", "world": "main", "frame": {"url": child.url, "name": "child", "index": None, "is_main": False}}]}},
+        {"__mcp_native_ok": True},
         {"__mcp_native_ok": True, "value": None},
     ]
     page = FakePage([main, child])
@@ -513,8 +518,8 @@ async def test_clear_without_selector_clears_every_current_frame_and_cache():
         result = await get_trace_data("window.fn", world="main", clear=True)
 
     assert {item["traceId"] for item in result["window.fn"]} == {"main", "child", "cached"}
-    assert main.evaluate.await_count == 2
-    assert child.evaluate.await_count == 2
+    assert main.evaluate.await_count == 4
+    assert child.evaluate.await_count == 4
     assert manager._persistent_traces == {}
     assert list(manager._persistent_trace_order) == []
     main.evaluate.side_effect = None
@@ -604,3 +609,340 @@ async def test_get_page_info_exposes_current_frame_snapshot():
     assert result["frames"][0]["is_main"] is True
     assert result["frames"][1]["parent_index"] == 0
     assert result["frames"][1]["name"] == "child"
+
+
+class NodeWorldTarget:
+    """Execute the actual generated JS, with the two transport prefixes emulated."""
+
+    url = "https://audit.test/"
+    frames = []
+
+    def __init__(self):
+        self.process = subprocess.Popen(
+            ["node", "-e", r"""
+            globalThis.window = globalThis;
+            window.top = window; window.name = '';
+            window.wrappedJSObject = window;
+            globalThis.location = {href: 'https://audit.test/'};
+            console.log = () => {};
+            require('readline').createInterface({input: process.stdin})
+              .on('line', async line => {
+                try {
+                  let source = JSON.parse(line);
+                  if (source.startsWith('mw:')) source = source.slice(3);
+                  source = source.trim().replace(/;\s*$/, '');
+                  let value = eval('(' + source + ')');
+                  if (typeof value === 'function') value = value();
+                  value = await value;
+                  process.stdout.write(JSON.stringify({value}) + '\n');
+                } catch (error) {
+                  process.stdout.write(JSON.stringify({error: error.message}) + '\n');
+                }
+              });
+            """],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+
+    async def evaluate(self, script):
+        self.process.stdin.write(json.dumps(script) + "\n")
+        self.process.stdin.flush()
+        result = json.loads(self.process.stdout.readline())
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result.get("value")
+
+    def close(self):
+        self.process.terminate()
+        self.process.wait(timeout=5)
+        self.process.stdin.close()
+        self.process.stdout.close()
+
+
+@pytest.fixture
+def node_world_target():
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is unavailable")
+    target = NodeWorldTarget()
+    try:
+        yield target
+    finally:
+        target.close()
+
+
+@pytest.mark.asyncio
+async def test_native_script_failure_never_replays_side_effects(node_world_target):
+    target = node_world_target
+    await target.evaluate("() => { window.calls = 0; }")
+    with pytest.raises(RuntimeError, match="caller failed"):
+        await evaluate_in_world(
+            target, "() => { window.calls++; throw new Error('caller failed'); }", "main"
+        )
+    assert await target.evaluate("() => window.calls") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clear_path", [None, "window.fn"])
+async def test_clear_then_call_keeps_trace_wrapper_and_return_value(node_world_target, clear_path):
+    target = node_world_target
+    manager = SimpleNamespace(
+        get_active_page=AsyncMock(return_value=target),
+        _persistent_scripts=[],
+        _persistent_traces={},
+        _persistent_trace_order=deque(),
+    )
+    await target.evaluate("() => { window.fn = value => value + 1; }")
+    with patch("camoufox_reverse_mcp.tools.hooking.browser_manager", manager):
+        result = await hook_function("window.fn", mode="trace", world="main")
+        assert result["status"] == "tracing"
+        assert await target.evaluate("() => window.fn(1)") == 2
+        cleared = await get_trace_data(clear_path, world="main", clear=True)
+        assert len(cleared["window.fn"]) == 1
+        assert await target.evaluate("() => window.fn(2)") == 3
+        later = await get_trace_data("window.fn", world="main")
+        assert len(later["window.fn"]) == 1
+        assert later["window.fn"][0]["args"] == "[2]"
+
+
+@pytest.mark.asyncio
+async def test_future_frame_persistent_registration_captures_first_call():
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is unavailable")
+    main = FakeFrame("about:blank")
+    page = FakePage([main])
+    manager = SimpleNamespace(
+        get_active_page=AsyncMock(return_value=page),
+        add_persistent_script=AsyncMock(),
+        _persistent_scripts=[],
+    )
+    with patch("camoufox_reverse_mcp.tools.hooking.browser_manager", manager):
+        result = await hook_function(
+            "window.FEILIN.fn", mode="trace", world="main", persistent=True,
+            frame_url="https://frame.test/*", wait_timeout_ms=100,
+        )
+    assert result["status"] == "pending"
+    assert result["pending_reason"] == "frame_not_found"
+    assert result["persistent_registered"] is True
+    init_script = manager.add_persistent_script.await_args.args[1]
+    script = f"""
+    globalThis.window = globalThis; window.top = {{}}; window.name = 'child';
+    window.wrappedJSObject = window;
+    globalThis.location = {{href: 'https://frame.test/content'}};
+    const log = console.log; console.log = () => {{}};
+    const pending = {init_script};
+    window.FEILIN = {{}};
+    window.FEILIN.fn = value => value + 1;
+    const returned = window.FEILIN.fn(41);
+    pending.then(result => log(JSON.stringify({{result, returned,
+        traces: window.__mcp_traces['window.FEILIN.fn']}})));
+    """
+    completed = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    actual = json.loads(completed.stdout)
+    assert actual["result"]["ok"] is True
+    assert actual["returned"] == 42
+    assert len(actual["traces"]) == 1
+    assert actual["traces"][0]["frame"]["url"] == "https://frame.test/content"
+
+
+@pytest.mark.asyncio
+async def test_remove_hooks_restores_generated_wrapper(node_world_target):
+    target = node_world_target
+    manager = SimpleNamespace(
+        get_active_page=AsyncMock(return_value=target),
+        _persistent_scripts=[], _init_scripts=[],
+    )
+    await target.evaluate("() => { window.originalFn = value => value + 1; window.fn = window.originalFn; }")
+    with patch("camoufox_reverse_mcp.tools.hooking.browser_manager", manager):
+        assert (await hook_function("window.fn", mode="trace", world="main"))["status"] == "tracing"
+        assert await target.evaluate("() => window.fn !== window.originalFn")
+        removed = await remove_hooks()
+    assert any(item.endswith(":window.fn") for item in removed["restored_objects"])
+    assert await target.evaluate("() => window.fn === window.originalFn")
+    assert await target.evaluate("() => window.fn(41)") == 42
+
+
+@pytest.mark.asyncio
+async def test_remove_hooks_preserves_new_page_replacement(node_world_target):
+    target = node_world_target
+    manager = SimpleNamespace(
+        get_active_page=AsyncMock(return_value=target),
+        _persistent_scripts=[], _init_scripts=[],
+    )
+    await target.evaluate("() => { window.fn = value => value + 1; }")
+    with patch("camoufox_reverse_mcp.tools.hooking.browser_manager", manager):
+        await hook_function("window.fn", mode="trace", world="main")
+        await target.evaluate("() => { window.replacement = value => value + 2; window.fn = window.replacement; }")
+        await remove_hooks()
+    assert await target.evaluate("() => window.fn === window.replacement")
+    assert await target.evaluate("() => window.fn(40)") == 42
+
+
+@pytest.mark.asyncio
+async def test_remove_locked_hook_reports_partial_and_relaunch(node_world_target):
+    target = node_world_target
+    manager = SimpleNamespace(
+        get_active_page=AsyncMock(return_value=target),
+        _persistent_scripts=[], _init_scripts=[],
+    )
+    await target.evaluate("() => { window.fn = value => value + 1; }")
+    with patch("camoufox_reverse_mcp.tools.hooking.browser_manager", manager):
+        hooked = await hook_function("window.fn", mode="trace", world="main", non_overridable=True)
+        assert hooked["status"] == "tracing"
+        result = await remove_hooks()
+    assert result["status"] == "hooks_partially_removed"
+    assert result["requires_relaunch"] is True
+    assert not result["restored_objects"]
+    assert result["warnings"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry", ["_init_scripts", "_persistent_scripts"])
+async def test_repeated_remove_keeps_retired_init_script_warning(node_world_target, registry):
+    manager = BrowserManager()
+    manager.get_active_page = AsyncMock(return_value=node_world_target)
+    getattr(manager, registry).append("fixture-script")
+    with patch("camoufox_reverse_mcp.tools.hooking.browser_manager", manager):
+        first = await remove_hooks()
+        second = await remove_hooks()
+    assert first["requires_relaunch"] is True
+    assert second["cleared_init_scripts"] == 0
+    assert second["cleared_persistent_scripts"] == 0
+    assert second["requires_relaunch"] is True
+    assert any("disconnecting/reconnecting MCP is insufficient" in text for text in second["warnings"])
+    manager._cm = SimpleNamespace(__aexit__=AsyncMock())
+    await manager.close()
+    assert manager._retired_hook_scripts is False
+
+
+@pytest.mark.asyncio
+async def test_attach_disconnect_preserves_retired_init_script_warning():
+    manager = BrowserManager()
+    manager._retired_hook_scripts = True
+    manager._connected = True
+    manager._pw = SimpleNamespace(stop=AsyncMock())
+    await manager.close()
+    assert manager._retired_hook_scripts is True
+    await manager.close()
+    assert manager._retired_hook_scripts is True
+
+
+@pytest.mark.asyncio
+async def test_uninstall_restores_inherited_accessor_function(node_world_target):
+    target = node_world_target
+    await target.evaluate("""() => {
+        window.originalFn = value => value + 1;
+        let stored = window.originalFn;
+        const proto = {};
+        Object.defineProperty(proto, 'fn', {
+            get() { return stored; }, set(value) { stored = value; }, configurable: true
+        });
+        window.obj = Object.create(proto);
+    }""")
+    manager = SimpleNamespace(
+        get_active_page=AsyncMock(return_value=target),
+        _persistent_scripts=[], _init_scripts=[],
+    )
+    with patch("camoufox_reverse_mcp.tools.hooking.browser_manager", manager):
+        assert (await hook_function("window.obj.fn", mode="trace", world="main"))["status"] == "tracing"
+        assert await target.evaluate("() => window.obj.fn !== window.originalFn")
+        removed = await remove_hooks()
+    assert removed["status"] == "hooks_removed", removed
+    assert await target.evaluate("() => window.obj.fn === window.originalFn")
+    assert not await target.evaluate("() => Object.hasOwn(window.obj, 'fn')")
+
+
+@pytest.mark.asyncio
+async def test_frozen_pending_watcher_reports_partial_and_retains_cleanup(node_world_target):
+    target = node_world_target
+    core = _watcher_core("window.obj.fn", wait_timeout_ms=100)
+    await target.evaluate(f"() => {{ window.obj = {{}}; window.pending = {core}; Object.freeze(window.obj); }}")
+    manager = SimpleNamespace(
+        get_active_page=AsyncMock(return_value=target),
+        _persistent_scripts=[], _init_scripts=[],
+    )
+    with patch("camoufox_reverse_mcp.tools.hooking.browser_manager", manager):
+        first = await remove_hooks()
+        second = await remove_hooks()
+    for result in (first, second):
+        assert result["status"] == "hooks_partially_removed"
+        assert result["requires_relaunch"] is True
+        assert any("watcher cleanup failed" in warning for warning in result["warnings"])
+    assert await target.evaluate("() => window.__mcp_function_hook_state.pending.length") == 1
+    assert (await target.evaluate("() => window.pending"))["error"] == "watcher_cleanup_failed"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_assignment_watcher_preserves_inherited_setter():
+    core = _watcher_core("window.obj.fn", wait_timeout_ms=100)
+    script = f"""
+    globalThis.window = globalThis; window.top = window; window.name = '';
+    globalThis.location = {{href: 'https://audit.test/'}};
+    let stored, setterCalls = 0;
+    const proto = {{}};
+    Object.defineProperty(proto, 'fn', {{
+        get() {{ return stored; }}, set(value) {{ stored = value; setterCalls++; }},
+        configurable: true
+    }});
+    window.obj = Object.create(proto);
+    const pending = {core};
+    const original = value => value + 1;
+    window.obj.fn = original;
+    const immediately = {{setterCalls, storedOriginal: stored === original,
+                          hasOwn: Object.hasOwn(window.obj, 'fn')}};
+    pending.then(result => console.log(JSON.stringify({{result, immediately}})));
+    """
+    completed = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    result = json.loads(completed.stdout)
+    assert result["result"]["ok"] is True
+    assert result["immediately"] == {"setterCalls": 1, "storedOriginal": True, "hasOwn": False}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_assignment_watcher_preserves_inherited_readonly_property():
+    core = _watcher_core("window.obj.fn", wait_timeout_ms=20)
+    script = f"""
+    globalThis.window = globalThis; window.top = window; window.name = '';
+    globalThis.location = {{href: 'https://audit.test/'}};
+    const proto = {{}};
+    Object.defineProperty(proto, 'fn', {{value: undefined, writable: false}});
+    window.obj = Object.create(proto);
+    const pending = {core};
+    window.obj.fn = value => value + 1;
+    const hasOwn = Object.hasOwn(window.obj, 'fn');
+    pending.then(result => console.log(JSON.stringify({{result, hasOwn,
+        remainsUndefined: window.obj.fn === undefined}})));
+    """
+    completed = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    result = json.loads(completed.stdout)
+    assert result["result"]["error"] == "target_not_found"
+    assert result["hasOwn"] is False
+    assert result["remainsUndefined"] is True
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_uninstall_cancels_pending_assignment_watcher():
+    core = _watcher_core("window.FUTURE.fn", wait_timeout_ms=100)
+    script = f"""
+    globalThis.window = globalThis; window.top = window; window.name = '';
+    globalThis.location = {{href: 'https://audit.test/'}};
+    const pending = {core};
+    const before = Object.getOwnPropertyDescriptor(window, 'FUTURE');
+    const removed = window.__mcp_function_uninstall();
+    const after = Object.getOwnPropertyDescriptor(window, 'FUTURE');
+    window.FUTURE = {{fn: value => value + 1}};
+    const returned = window.FUTURE.fn(41);
+    pending.then(result => console.log(JSON.stringify({{
+      hadWatcher: typeof before.set === 'function', restoredMissing: !after,
+      removed, result, returned, traceCount: Object.keys(window.__mcp_traces || {{}}).length,
+      pendingCount: window.__mcp_function_hook_state.pending.length
+    }})));
+    """
+    completed = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    actual = json.loads(completed.stdout)
+    assert actual["hadWatcher"] and actual["restoredMissing"]
+    assert actual["removed"]["cancelled"] == 1
+    assert actual["result"]["error"] == "hook_install_cancelled"
+    assert actual["returned"] == 42
+    assert actual["traceCount"] == 0
+    assert actual["pendingCount"] == 0

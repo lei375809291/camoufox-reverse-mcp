@@ -313,6 +313,13 @@ trace_property_access(action="stop", mode="summary")
 
 ## Changelog
 
+### v1.5.1 (2026-09-07) — Trace Clearing and Hook Lifecycle Fixes
+
+- Preserve target function behavior after clearing Trace data
+- Probe main-world support before executing caller code; never replay it through another channel after execution fails
+- Register persistent hooks for frames that do not exist yet and return an explicit `pending` status
+- Restore hooks in current frames and execution worlds, and report locked properties that cannot be restored; no browser rebuild is required
+
 ### v1.5.0 (2026-09-04) — Main World, Frames, and Reliable Persistent Hooks
 
 - Add explicit `world="main"` to `evaluate_js` and `hook_function` while preserving the isolated-world default

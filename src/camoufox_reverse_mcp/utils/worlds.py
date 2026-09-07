@@ -54,11 +54,13 @@ async def evaluate_in_world(
         + invocation
         + ")}))()"
     )
+    # Probe without running caller code. Retrying a failed caller expression via
+    # another channel can repeat side effects (including page getters and calls
+    # that navigated away before Playwright received their result).
     try:
-        native = await target.evaluate("mw:" + native_script)
-        if not isinstance(native, dict) or native.get("__mcp_native_ok") is not True:
-            raise RuntimeError("Camoufox main-world channel returned no result sentinel")
-        return native.get("value"), "camoufox_native", None
+        probe = await target.evaluate("mw:() => ({__mcp_native_ok: true})")
+        if not isinstance(probe, dict) or probe.get("__mcp_native_ok") is not True:
+            raise RuntimeError("Camoufox main-world channel returned no probe sentinel")
     except Exception as native_error:
         try:
             value = await target.evaluate(
@@ -77,3 +79,11 @@ async def evaluate_in_world(
                 "main-world evaluation failed via both Camoufox native channel "
                 f"and wrappedJSObject fallback: {native_error} / {fallback_error}"
             ) from fallback_error
+
+    native = await target.evaluate("mw:" + native_script)
+    if not isinstance(native, dict) or native.get("__mcp_native_ok") is not True:
+        raise RuntimeError(
+            "Camoufox main-world execution returned no result sentinel; "
+            "the expression was not retried because it may have side effects"
+        )
+    return native.get("value"), "camoufox_native", None

@@ -58,6 +58,7 @@ class BrowserManager:
         self._capture_body = False
         self._init_scripts: list[str] = []
         self._persistent_scripts: list[dict] = []
+        self._retired_hook_scripts = False
         self._persistent_traces: dict[str, deque[dict]] = {}
         self._persistent_trace_order: deque[tuple[str, dict]] = deque()
         self._nav_responses: list[dict] = []  # 最近一次 navigate 记录到的响应链路
@@ -261,6 +262,8 @@ class BrowserManager:
         self._attach_listeners(page)
         self.pages["default"] = page
         self.active_page_name = "default"
+        # Owned launch creates a fresh context without retired init scripts.
+        self._retired_hook_scripts = False
 
         result = {
             "status": "launched",
@@ -545,6 +548,7 @@ class BrowserManager:
         Attach mode (connected to an external server): only disconnects the local
         Playwright client — the user's browser and server are left running.
         """
+        owned_context_closed = False
         trace_base_dir = self._trace_base_dir
         if trace_base_dir is not None:
             try:
@@ -570,6 +574,7 @@ class BrowserManager:
         elif self._cm is not None:
             try:
                 await self._cm.__aexit__(None, None, None)
+                owned_context_closed = True
             except Exception:
                 pass
         stale_controls_removed = 0
@@ -599,6 +604,9 @@ class BrowserManager:
         self._capture_body = False
         self._init_scripts.clear()
         self._persistent_scripts.clear()
+        # Disconnecting leaves external contexts and their init scripts alive.
+        if owned_context_closed:
+            self._retired_hook_scripts = False
         self._persistent_traces.clear()
         self._persistent_trace_order.clear()
         self._nav_responses.clear()

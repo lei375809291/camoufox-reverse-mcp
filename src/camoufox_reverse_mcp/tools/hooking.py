@@ -130,11 +130,19 @@ def _build_installer_core(
             if ({str(log_stack).lower()}) entry.stack = new Error().stack;
             const result = original.apply(this, args);
             if ({str(log_return).lower()}) entry.returnValue = __mcpSafe(result, 2000);
-            window.__mcp_traces[path].push(entry);
+            // Clearing retrieved traces must not disable an installed wrapper.
+            // Recording failures must not change the original function's result.
+            try {{
+                window.__mcp_traces = window.__mcp_traces || {{}};
+                if (!Array.isArray(window.__mcp_traces[path]))
+                    window.__mcp_traces[path] = [];
+                window.__mcp_traces[path].push(entry);
+            }} catch(e) {{}}
             try {{
                 console.log('__MCP_TRACE__:' + JSON.stringify({{...entry, __path__: path}}));
             }} catch(e) {{}}
-            console.log('[TRACE:' + path + ']', 'call #' + captureCount);
+            try {{ console.log('[TRACE:' + path + ']', 'call #' + captureCount); }}
+            catch(e) {{}}
             return result;
         }};
         try {{ Object.defineProperty(wrapper, 'name', {{ value: funcName }}); }} catch(e) {{}}
@@ -188,19 +196,70 @@ def _build_installer_core(
         return {{ ok: false, error: 'frame_selector_mismatch', target: path,
             frame: __mcpFrameMeta() }};
     }}
+    const __mcpState = window.__mcp_function_hook_state
+        || (window.__mcp_function_hook_state = {{records: [], pending: []}});
+    window.__mcp_function_uninstall = () => {{
+        const result = {{restored: [], errors: [], cancelled: 0}};
+        for (const pending of __mcpState.pending.splice(0)) {{
+            pending.cancelled = true;
+            const errors = pending.cleanup();
+            if (errors.length) {{
+                result.errors.push(...errors);
+                __mcpState.pending.push(pending);
+            }}
+            result.cancelled++;
+        }}
+        const remaining = [];
+        for (const record of __mcpState.records.splice(0).reverse()) {{
+            try {{
+                // Preserve replacements made by the page after our hook.
+                if (record.parent[record.key] !== record.wrapper) continue;
+                if (record.descriptor) {{
+                    if (record.descriptor.set)
+                        record.parent[record.key] = record.original;
+                    Object.defineProperty(record.parent, record.key, record.descriptor);
+                }} else {{
+                    delete record.parent[record.key];
+                    if (record.inheritedDescriptor && record.inheritedDescriptor.set)
+                        record.parent[record.key] = record.original;
+                    if (record.parent[record.key] === record.wrapper)
+                        throw new Error('target remains non-configurable');
+                }}
+                result.restored.push(record.path);
+            }} catch(error) {{
+                remaining.push(record);
+                result.errors.push(record.path + ': ' + error.message);
+            }}
+        }}
+        __mcpState.records.push(...remaining.reverse());
+        return result;
+    }};
+    let __mcpPending;
     const __mcpInstall = (parent, funcName, original) => {{
         if (original.__mcpInstallId === {install_json}) {{
             return {{ ok: true, already_installed: true, target: path,
                 frame: {frame_expression} }};
+        }}
+        const originalDescriptor = Object.getOwnPropertyDescriptor(parent, funcName);
+        let inheritedDescriptor;
+        if (!originalDescriptor) {{
+            for (let proto = Object.getPrototypeOf(parent); proto; proto = Object.getPrototypeOf(proto)) {{
+                inheritedDescriptor = Object.getOwnPropertyDescriptor(proto, funcName);
+                if (inheritedDescriptor) break;
+            }}
         }}
         {wrapper_code}
         if (parent[funcName] !== wrapper) {{
             return {{ ok: false, error: 'target_not_replaceable', target: path,
                 frame: {frame_expression} }};
         }}
+        __mcpState.records.push({{parent, key: funcName, original,
+            descriptor: originalDescriptor, inheritedDescriptor, wrapper, path}});
         return {{ ok: true, target: path, frame: {frame_expression} }};
     }};
     const __mcpTryInstall = () => {{
+        if (__mcpPending && __mcpPending.cancelled)
+            return {{ok: false, error: 'hook_install_cancelled', target: path}};
         let parent = window;
         for (let i = 0; i < parts.length - 1; i++) {{
             if (!parent) return {{ ok: false }};
@@ -221,9 +280,19 @@ def _build_installer_core(
     const __mcpWatched = new WeakMap();
     const __mcpWatchCleanups = [];
     const __mcpCleanupWatchers = () => {{
+        const failed = [];
+        const errors = [];
         while (__mcpWatchCleanups.length) {{
-            try {{ __mcpWatchCleanups.pop()(); }} catch(e) {{}}
+            const cleanup = __mcpWatchCleanups.pop();
+            try {{ cleanup(); }} catch(error) {{
+                failed.push(cleanup);
+                errors.push(path + ': watcher cleanup failed: ' + error.message);
+            }}
         }}
+        __mcpWatchCleanups.push(...failed.reverse());
+        const index = __mcpState.pending.indexOf(__mcpPending);
+        if (!failed.length && index !== -1) __mcpState.pending.splice(index, 1);
+        return errors;
     }};
     const __mcpArmWatcher = (parent, key) => {{
         if (!{str(watch_assignments).lower()} || !parent
@@ -233,6 +302,15 @@ def _build_installer_core(
         if (keys.has(key)) return true;
         const own = Object.getOwnPropertyDescriptor(parent, key);
         if (own && (!own.configurable || own.get || own.set || !own.writable)) return false;
+        if (!own) {{
+            for (let proto = Object.getPrototypeOf(parent); proto; proto = Object.getPrototypeOf(proto)) {{
+                const inherited = Object.getOwnPropertyDescriptor(proto, key);
+                if (!inherited) continue;
+                // Do not replace inherited setter/read-only assignment semantics.
+                if (inherited.get || inherited.set || !inherited.writable) return false;
+                break;
+            }}
+        }}
         let current = own ? own.value : undefined;
         if (current !== undefined && current !== null) return false;
         const enumerable = own ? own.enumerable : true;
@@ -261,27 +339,36 @@ def _build_installer_core(
                 keys.delete(key);
                 if (own) Object.defineProperty(parent, key, own);
                 else delete parent[key];
+                const remaining = Object.getOwnPropertyDescriptor(parent, key);
+                if (remaining && remaining.get === watcherGet && remaining.set === watcherSet)
+                    throw new Error('property ' + key + ' is no longer configurable');
             }});
             keys.add(key);
             return true;
         }} catch(e) {{ return false; }}
     }};
+    __mcpPending = {{cancelled: false, cleanup: __mcpCleanupWatchers}};
+    __mcpState.pending.push(__mcpPending);
     const deadline = Date.now() + {wait_timeout_ms};
-    let initial = __mcpTryInstall();
-    if (initial.ok) {{ __mcpCleanupWatchers(); return initial; }}
-    if (initial.error) {{ __mcpCleanupWatchers(); return initial; }}
-    if (initial.missingParent) __mcpArmWatcher(initial.missingParent, initial.missingKey);
-    while (true) {{
-        if (Date.now() >= deadline) {{
-            __mcpCleanupWatchers();
-            return {{ ok: false, error: 'target_not_found', target: path,
-                waited_ms: {wait_timeout_ms}, frame: __mcpFrameMeta() }};
+    try {{
+        const initial = __mcpTryInstall();
+        if (initial.ok || initial.error) return initial;
+        if (initial.missingParent) __mcpArmWatcher(initial.missingParent, initial.missingKey);
+        while (true) {{
+            if (Date.now() >= deadline) {{
+                return {{ ok: false, error: 'target_not_found', target: path,
+                    waited_ms: {wait_timeout_ms}, frame: __mcpFrameMeta() }};
+            }}
+            await new Promise(resolve => setTimeout(resolve, {poll_interval_ms}));
+            const outcome = __mcpTryInstall();
+            if (outcome.ok || outcome.error) return outcome;
+            if (outcome.missingParent) __mcpArmWatcher(outcome.missingParent, outcome.missingKey);
         }}
-        await new Promise(resolve => setTimeout(resolve, {poll_interval_ms}));
-        const outcome = __mcpTryInstall();
-        if (outcome.ok) {{ __mcpCleanupWatchers(); return outcome; }}
-        if (outcome.error) {{ __mcpCleanupWatchers(); return outcome; }}
-        if (outcome.missingParent) __mcpArmWatcher(outcome.missingParent, outcome.missingKey);
+    }} finally {{
+        const cleanupErrors = __mcpCleanupWatchers();
+        if (cleanupErrors.length)
+            return {{ok: false, error: 'watcher_cleanup_failed', target: path,
+                details: cleanupErrors}};
     }}
 }})()"""
 
@@ -387,12 +474,19 @@ async def hook_function(
         if not isinstance(watch_late, bool):
             return {"error": "watch_assignments must be true or false"}
         page = await browser_manager.get_active_page()
-        target, frame_meta = resolve_frame(
-            page,
-            frame_url=frame_url,
-            frame_name=frame_name,
-            frame_index=frame_index,
-        )
+        try:
+            target, frame_meta = resolve_frame(
+                page,
+                frame_url=frame_url,
+                frame_name=frame_name,
+                frame_index=frame_index,
+            )
+        except ValueError as exc:
+            if not persistent or not str(exc).startswith("frame_not_found:"):
+                raise
+            # A future iframe may not exist yet. Register its guarded init
+            # script now so its first page-script call can still be captured.
+            target, frame_meta = None, None
         selector = persistent_frame_guard(
             frame_url=frame_url,
             frame_name=frame_name,
@@ -467,9 +561,13 @@ async def hook_function(
                 await browser_manager.add_persistent_script(script_name, persistent_js)
                 persistent_registered = True
 
-        install_result, execution_backend, execution_warning = await evaluate_in_world(
-            target, immediate_core, world, script_is_function=False
-        )
+        if target is None:
+            install_result = {"ok": False, "error": "frame_not_found"}
+            execution_backend, execution_warning = None, None
+        else:
+            install_result, execution_backend, execution_warning = await evaluate_in_world(
+                target, immediate_core, world, script_is_function=False
+            )
         if not isinstance(install_result, dict) or not install_result.get("ok"):
             error = (
                 install_result.get("error", "hook_install_failed")
@@ -489,7 +587,9 @@ async def hook_function(
                 "execution_backend": execution_backend,
                 "warnings": [execution_warning] if execution_warning else None,
             }
-            if persistent and error in {"target_not_found", "frame_selector_mismatch"}:
+            if persistent and error in {
+                "target_not_found", "frame_selector_mismatch", "frame_not_found"
+            }:
                 result.update({
                     "status": "pending",
                     "install_state": "pending",
@@ -780,6 +880,7 @@ async def remove_hooks(keep_persistent: bool = False) -> dict:
         page = await browser_manager.get_active_page()
         warnings: list[str] = []
         restored: list[str] = []
+        uninstall_incomplete = False
 
         uninstall_js = r"""
         (function() {
@@ -812,8 +913,41 @@ async def remove_hooks(keep_persistent: bool = False) -> dict:
                     restored.append(hook)
             for err in (in_page.get("errors") or []):
                 warnings.append(f"in-page uninstall: {err}")
+                uninstall_incomplete = True
         except Exception as e:
             warnings.append(f"in-page uninstall eval failed: {e}")
+            uninstall_incomplete = True
+
+        frames = list(getattr(page, "frames", []) or [])
+        targets = frames or [page]
+        cancelled_pending = 0
+        generic_uninstall = """() => {
+            if (typeof window.__mcp_function_uninstall !== 'function')
+                return {restored: [], errors: [], cancelled: 0};
+            return window.__mcp_function_uninstall();
+        }"""
+        for index, target in enumerate(targets):
+            for world in ("isolated", "main"):
+                try:
+                    outcome, _, _ = await evaluate_in_world(
+                        target, generic_uninstall, world
+                    )
+                    if not isinstance(outcome, dict):
+                        continue
+                    restored.extend(
+                        f"{world}:frame[{index}]:{path}"
+                        for path in outcome.get("restored", [])
+                    )
+                    cancelled_pending += outcome.get("cancelled", 0)
+                    warnings.extend(
+                        f"{world}:frame[{index}]: {error}"
+                        for error in outcome.get("errors", [])
+                    )
+                    if outcome.get("errors"):
+                        uninstall_incomplete = True
+                except Exception as exc:
+                    warnings.append(f"{world}:frame[{index}] uninstall failed: {exc}")
+                    uninstall_incomplete = True
 
         cleared_init = len(browser_manager._init_scripts)
         browser_manager._init_scripts.clear()
@@ -821,20 +955,25 @@ async def remove_hooks(keep_persistent: bool = False) -> dict:
         if not keep_persistent:
             cleared_persistent = len(browser_manager._persistent_scripts)
             browser_manager._persistent_scripts.clear()
-            if cleared_persistent:
-                warnings.append(
-                    "Persistent scripts were removed from the MCP registry, but "
-                    "Playwright cannot unregister init scripts from an existing "
-                    "BrowserContext. Close and relaunch the browser before relying "
-                    "on their complete removal."
-                )
+        if cleared_init or cleared_persistent:
+            browser_manager._retired_hook_scripts = True
+        retired_scripts = bool(getattr(browser_manager, "_retired_hook_scripts", False))
+        if retired_scripts:
+            warnings.append(
+                "Scripts removed from the MCP registry remain installed in the "
+                "existing Playwright Page/BrowserContext and may run on navigation. "
+                "Create a new browser/context for complete removal; when attached "
+                "to an external browser, disconnecting/reconnecting MCP is insufficient."
+            )
 
         return {
-            "status": "hooks_removed",
+            "status": "hooks_partially_removed" if uninstall_incomplete else "hooks_removed",
             "restored_objects": restored,
             "cleared_init_scripts": cleared_init,
             "cleared_persistent_scripts": cleared_persistent if not keep_persistent else 0,
             "persistent_kept": keep_persistent,
+            "cancelled_pending_hooks": cancelled_pending,
+            "requires_relaunch": uninstall_incomplete or retired_scripts,
             "warnings": warnings if warnings else None,
         }
     except Exception as e:
