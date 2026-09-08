@@ -8,19 +8,18 @@ An MCP (Model Context Protocol) server that gives AI coding assistants (Claude C
 
 ## Why Camoufox?
 
-| Feature | chrome-devtools-mcp | **camoufox-reverse-mcp** |
-|---------|--------------------|-----------------------|
-| Browser Engine | Chrome (Puppeteer) | **Firefox (Camoufox)** |
-| Anti-Detection | None | **C++ engine-level fingerprint spoofing** |
-| Debug Capability | Limited (no breakpoints) | **Playwright + JS Hook** |
-| JSVMP Analysis | None | **Interpreter instrumentation + source-level rewriting** |
-| Hook Persistence | Not supported | **Context-level persistence, auto re-inject after navigation** |
+| Capability | Implementation |
+|---|---|
+| Browser | Firefox / Camoufox |
+| Runtime investigation | Explicit execution worlds, frames, hooks and network capture |
+| JSVMP investigation | Runtime probes and source instrumentation, validated per target |
+| Persistent hooks | Context initialization with explicit pending/removal boundaries |
 
 **Core Advantages:**
 - Camoufox modifies fingerprint information at the **C++ engine level**, avoiding common JS descriptor/prototype patch artifacts
 - Juggler protocol isolation reduces page-world automation artifacts
 - BrowserForge generates fingerprints based on **real-world traffic distribution**
-- Works on sites with strong bot detection: RS, AK, JY, CF, etc.
+- Supports investigation of protected applications; success must be verified for each target and is not guaranteed by the browser choice
 - Hooks use `Object.defineProperty` with **override protection**
 
 ---

@@ -8,19 +8,18 @@
 
 ## 为什么选择 Camoufox？
 
-| 特性 | chrome-devtools-mcp | **camoufox-reverse-mcp** |
-|-----|--------------------|-----------------------|
-| 浏览器内核 | Chrome (Puppeteer) | **Firefox (Camoufox)** |
-| 反检测方案 | 无 | **C++ 引擎级指纹伪造** |
-| 调试能力 | 有限（无断点） | **Playwright + JS Hook** |
-| JSVMP 分析 | 无 | **解释器插桩 + 源码级改写** |
-| Hook 持久化 | 不支持 | **context 级持久化，导航后自动重注入** |
+| 能力 | 实现与边界 |
+|---|---|
+| 浏览器 | Firefox / Camoufox |
+| 运行时分析 | 显式执行世界、Frame、Hook 与网络捕获 |
+| JSVMP 调查 | 运行时探针与源码插桩，按具体目标验证 |
+| 持久 Hook | Context 初始化，明确 pending 与卸载边界 |
 
 **核心优势：**
 - Camoufox 在 **C++ 层面** 修改指纹信息，不依赖页面 JS patch，避免常见的 descriptor/prototype 泄露
-- Juggler 协议沙箱隔离使 Playwright **完全不可被页面 JS 检测到**
+- Juggler 隔离减少部分页面侧自动化痕迹；Hook、环境差异与时序仍可能被观察
 - BrowserForge 按 **真实世界流量统计分布** 生成指纹，不是随机拼凑
-- 能在 RS、AK、JY、CF 等各类强反爬站点上正常工作
+- 可用于反爬与环境依赖分析；具体站点的可用性必须通过实际样本验证
 - Hook 使用 `Object.defineProperty` **防覆盖保护**，页面脚本无法恢复原始方法
 
 ---
