@@ -46,7 +46,7 @@ def test_unicode_source_lines_and_hashbang_survive():
     assert rewritten.startswith('#!/usr/bin/env node\n"use strict";')
     site=next(x for x in stats['source_sites'] if source[x['start']:x['end']]=='{k:2}).k' or source[x['start']:x['end']]=='({k:2}).k')
     assert site['line']==3
-    completed=subprocess.run(['node','--check'],input=rewritten,capture_output=True,text=True)
+    completed=subprocess.run(['node','--check'],input=rewritten,capture_output=True,encoding='utf-8')
     assert completed.returncode==0,completed.stderr
 
 
