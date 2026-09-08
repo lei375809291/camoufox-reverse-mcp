@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
+import json
+import shutil
 from typing import Any
 
 from ..server import browser_manager, mcp
@@ -41,26 +44,30 @@ async def check_environment() -> dict:
         except ImportError:
             deps[dep] = {"installed": False, "version": None, "ok": False}
 
-    # Browser state
-    browser_state: dict[str, Any] = {"running": False}
+    # Read-only live state. Captured data and installed hooks may be the user's
+    # current evidence, not disposable residue. Never recommend a blanket reset.
+    browser_state: dict[str, Any] = {"running": False, "has_residuals": False}
     try:
-        if browser_manager.browser is not None:
-            browser_state["running"] = True
-            ctx = browser_manager.contexts.get("default")
-            pages = ctx.pages if ctx else []
+        browser = browser_manager.browser
+        if browser is not None:
+            connected = getattr(browser, "is_connected", None)
+            browser_state["running"] = bool(connected()) if callable(connected) else True
+            browser_state["instance_id"] = getattr(browser_manager, "_browser_instance_id", None)
+            browser_state["ownership"] = "attached" if browser_manager._connected else "owned"
+            pages = [{"name": name, "url": page.url} for name, page in browser_manager.pages.items()]
+            browser_state["pages"] = pages
             browser_state["page_count"] = len(pages)
             browser_state["persistent_scripts_count"] = len(browser_manager._persistent_scripts)
             browser_state["active_captures"] = browser_manager._capturing
             browser_state["captured_requests_count"] = len(browser_manager._network_requests)
-            has_residuals = (
-                browser_state["persistent_scripts_count"] > 0
-                or browser_state["captured_requests_count"] > 0
-            )
-            browser_state["has_residuals"] = has_residuals
-            if has_residuals:
-                recommendations.append("Browser has residual state. Consider reset_browser_state().")
-    except Exception as e:
-        browser_state["error"] = str(e)
+            browser_state["has_residuals"] = bool(browser_manager._persistent_scripts or browser_manager._network_requests)
+            if browser_state["has_residuals"]:
+                recommendations.append("Existing hooks/captures may belong to the current task. Reuse relevant evidence; inspect scope before clearing or replacing anything.")
+            if not browser_state["running"]:
+                recommendations.append("Browser transport is disconnected. Re-launch explicitly and collect fresh page evidence.")
+        browser_state["review_policy"] = "Check at task start and when relevant state changes; do not reset or recheck the full environment before every tool call."
+    except Exception as exc:
+        browser_state["error"] = str(exc)
 
     # Camoufox Python/browser runtime discovery is strictly read-only. In
     # particular, this does not call get_active_path(), which may auto-select
@@ -168,7 +175,23 @@ async def check_environment() -> dict:
     except Exception:
         pass
 
+    fingerprint = hashlib.sha256(json.dumps({
+        "mcp_version": version,
+        "browser_instance": browser_state.get("instance_id"),
+        "running": browser_state.get("running"),
+        "pages": browser_state.get("pages", []),
+        "persistent_scripts": [s.get("name") for s in browser_manager._persistent_scripts],
+        "runtime": (browser_manager._runtime_browser or camoufox_runtime.get("active") or {}).get("selector"),
+    }, sort_keys=True, default=str).encode()).hexdigest()
     return {
+        "review": {"state_fingerprint": fingerprint,
+                   "scope": "task", "automatic_reset": False,
+                   "fingerprint_is_complete_state": False,
+                   "invalidate_on": ["browser restart/disconnect", "target or frame changed", "SDK or signer changed", "auth state changed", "hook/trace mode changed", "relevant operation failed"],
+                   "note": "Fingerprint is a scope hint, not proof of unchanged page/auth/SDK state. Refresh only the checks affected by an observed change."},
+        "task_readiness": {"browser_analysis": overall_ok,
+                           "captured_evidence_review": True,
+                           "node_signer": shutil.which("node") is not None},
         "mcp": {"version": version, "version_ok": version_ok},
         "deps": deps,
         "browser": browser_state,

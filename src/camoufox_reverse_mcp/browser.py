@@ -4,6 +4,7 @@ import asyncio
 import os as _os
 import platform
 import time
+import uuid
 from collections import deque
 from typing import Any
 
@@ -45,6 +46,7 @@ class BrowserManager:
 
     def __init__(self) -> None:
         self.browser = None
+        self._browser_instance_id: str | None = None
         self.contexts: dict[str, BrowserContext] = {}
         self.pages: dict[str, Page] = {}
         self.active_page_name: str | None = None
@@ -96,6 +98,7 @@ class BrowserManager:
             return result
 
         cfg = {**self.default_config, **(config or {})}
+        self._browser_instance_id = uuid.uuid4().hex
 
         # Attach mode: connect to an already-running Camoufox Playwright server
         # (started via `python -m camoufox server`, which prints a ws:// endpoint)
@@ -322,6 +325,7 @@ class BrowserManager:
             self._pw = None
             self.browser = None
             self._connected = False
+            self._browser_instance_id = None
             self.contexts.clear()
             self.pages.clear()
             self.active_page_name = None
@@ -494,8 +498,11 @@ class BrowserManager:
         self._request_id_counter += 1
         try:
             post_data = req.post_data
-        except Exception:
+        except Exception as exc:
             post_data = None
+            post_data_error = str(exc)
+        else:
+            post_data_error = None
         entry = {
             "id": self._request_id_counter,
             "url": req.url,
@@ -503,6 +510,7 @@ class BrowserManager:
             "resource_type": req.resource_type,
             "request_headers": dict(req.headers),
             "request_post_data": post_data,
+            "request_post_data_error": post_data_error,
             "timestamp": int(time.time() * 1000),
             "status": None,
             "response_headers": None,
@@ -575,12 +583,15 @@ class BrowserManager:
             body_bytes = await resp.body()
             try:
                 body_text = body_bytes.decode("utf-8")
+                body_encoding = "utf-8"
             except UnicodeDecodeError:
                 body_text = body_bytes.decode("latin-1")
+                body_encoding = "latin-1"
             limit = self._capture_body_limit if limit is None else limit
             truncated = len(body_text) > limit
             entry.update(
                 response_body=body_text[:limit],
+                response_body_encoding=body_encoding,
                 response_body_truncated=truncated,
                 response_body_capture_truncated=truncated,
                 response_body_total_size=len(body_text),
@@ -679,6 +690,7 @@ class BrowserManager:
             except Exception:
                 pass
         self.browser = None
+        self._browser_instance_id = None
         self.contexts.clear()
         self.pages.clear()
         self.active_page_name = None

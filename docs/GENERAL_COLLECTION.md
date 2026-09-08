@@ -65,3 +65,19 @@ CAMOUFOX_COLLECTION_INTEGRATION=1 pytest -q tests/test_collection_browser.py
 ```
 
 通用分页程序、JSONL 恢复与 SDK 基线由配套 [hello_js_reverse_skill](https://github.com/WhiteNightShadow/hello_js_reverse_skill) 提供，MCP 本身不恢复已移除的 Session/Assertion 数据模块。
+
+## v1.7.0：请求证据与任务级诊断
+
+`compare_network_requests(request_ids=[...])` 对 2..10 条已有捕获做差异比较，保留重复 query、顺序、原始编码和 Body 原文。常量只返回字段名，原值仍从请求详情读取；输出按字段数与预览长度限制，比较不依赖被截短的预览。
+
+每个值的 `sha256_scope=canonical_json_utf8`、`length_unit=serialized_json_characters` 描述摘要口径。字符串另有 `raw_utf8.bytes/sha256`；与服务端 Body 哈希对照时用 `body.raw` 的 raw_utf8，不能把 JSON 引号/转义后的摘要拿来比较。
+
+`save_response_body(request_id, save_path, allow_partial=False)` 保存已有响应的可逆字节表示，适合 JS/WASM/JSON/二进制；返回实体字节数和SHA256，默认拒绝截断，拒绝覆盖已有文件，不触发新请求。`size`/`response_body_total_size` 等旧字段仍为字符数，增加 size_unit/body_bytes 明确口径；字节是解压后的实体，不是压缩传输线长度。
+
+`check_environment` 新增 review/task_readiness 与浏览器 instance_id。已有 Hook/捕获可能属于当前任务，不自动清理；指纹只是状态范围提示，不代表鉴权/SDK完全未变。任务开始检查一次，状态变化时只查相关项。
+
+`navigate` 保留真正的 goto 错误，不因错误日志出现 waiting 字样就当作超时。`take_snapshot(timeout_ms=5000, max_nodes=1000)` 有界等待，标注 accessibility/DOM fallback 与截断；超时后读页面和网络失败信息，不自动重放。初始化协议中的 serverInfo.version 与 check_environment 统一为 MCP 应用版本。
+
+请求发起栈增加 `match_confidence=heuristic/unavailable`；URL 匹配的 Hook 栈只是线索，不能当作同 URL 并发的精确归因。
+
+公开方案取舍和多轮实操方法见 [RESEARCH_AND_VALIDATION.md](RESEARCH_AND_VALIDATION.md)。

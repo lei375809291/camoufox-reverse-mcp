@@ -25,6 +25,14 @@ An MCP (Model Context Protocol) server that gives AI coding assistants (Claude C
 
 ---
 
+## v1.7.0: Evidence and Diagnostics Validated by Independent Agents
+
+- `compare_network_requests` and `save_response_body` preserve raw inputs and distinguish comparison hashes from entity-byte hashes.
+- Task-scoped environment reviews preserve existing evidence; navigation keeps original failures and snapshots have explicit time/output limits.
+- Three rounds of nine independent tasks retained failures and drove corrections. All final-round signer, WASM and pagination artifacts passed independent checks.
+
+See [release notes](docs/releases/v1.7.0.md) and the [research and validation record](docs/RESEARCH_AND_VALIDATION.md), including limits.
+
 ## v1.6.0: General Capture and Standalone Verification
 
 - Associate concurrent responses by Request identity, collect full cookie headers, and report failures, eviction, pending work and truncation explicitly.

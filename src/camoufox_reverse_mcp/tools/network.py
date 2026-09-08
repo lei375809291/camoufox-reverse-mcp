@@ -94,7 +94,9 @@ async def list_network_requests(
             Check network_capture(status).dropped_requests for lost history.
 
     Returns:
-        List of request summaries with id, url, method, status, type, ms, size.
+        List of request summaries. Legacy size is retained body characters;
+        size_unit is characters and body_bytes is the retained decoded entity
+        byte count when encoding is known. Not compressed wire bytes.
     """
     try:
         if limit is not None and not 1 <= limit <= 2000:
@@ -124,6 +126,9 @@ async def list_network_requests(
                 "id": r["id"], "url": r["url"][:200], "method": r["method"],
                 "status": r.get("status"), "type": r.get("resource_type"),
                 "ms": r.get("duration"), "size": body_size,
+                "size_unit": "characters",
+                "body_bytes": (len(r["response_body"].encode(r["response_body_encoding"]))
+                               if r.get("response_body") is not None and r.get("response_body_encoding") in ("utf-8", "latin-1") else None),
                 "has_body": r.get("response_body") is not None,
                 "state": r.get("state"), "body_state": r.get("body_state"),
                 "failure": r.get("failure"),
@@ -156,6 +161,7 @@ async def get_network_request(
         for r in browser_manager._network_requests:
             if r["id"] == request_id:
                 result = dict(r)
+                result["response_body_size_unit"] = "characters"
                 if not include_body:
                     body = result.pop("response_body", None)
                     result["response_body_available"] = body is not None
@@ -190,14 +196,15 @@ async def get_network_request(
 async def get_request_initiator(request_id: int) -> dict:
     """Get the JS call stack that initiated a network request.
 
-    Golden path: see encrypted param -> get_request_initiator -> find signing function.
+    Returns a URL-matched hook stack as an investigation lead, not exact request attribution.
+    Repeated/concurrent URLs can match a different invocation; corroborate with captured inputs.
     Requires inject_hook_preset("xhr"/"fetch") BEFORE navigating.
 
     KNOWN LIMITATIONS (v0.8.1+):
       1. For requests modified by an interceptor registered BEFORE MCP's
          hooks (e.g. SDKs loaded via sync <script>), the initiator will be
          the interceptor's call, not the original business code.
-         Workaround: use reload_with_hooks().
+         Workaround: use instrumentation(action='reload').
       2. For fetch on Firefox, Playwright-native initiator is often null.
          Requires inject_hook_preset('fetch', persistent=True).
 
@@ -205,7 +212,8 @@ async def get_request_initiator(request_id: int) -> dict:
         request_id: The ID of the request.
 
     Returns:
-        dict with url, initiator_stack, source, diagnostics.
+        dict with url, initiator_stack, source, diagnostics and match_confidence.
+        match_confidence is heuristic or unavailable; it never asserts exact identity.
     """
     try:
         target_entry = None
@@ -227,6 +235,7 @@ async def get_request_initiator(request_id: int) -> dict:
                 for (let i = logs.length - 1; i >= 0; i--) {{
                     const log = logs[i];
                     const logUrl = log.url || '';
+                    if (!logUrl) continue;
                     if (reqUrl === logUrl || reqUrl.includes(logUrl) || logUrl.includes(reqUrl)) {{
                         return {{
                             url: logUrl, stack: log.stack || null, type: type,
@@ -258,6 +267,7 @@ async def get_request_initiator(request_id: int) -> dict:
             for (let i = fetchInitLog.length - 1; i >= 0; i--) {{
                 const entry = fetchInitLog[i];
                 const logUrl = entry.url || '';
+                if (!logUrl) continue;
                 if (reqUrl === logUrl || reqUrl.includes(logUrl) || logUrl.includes(reqUrl)) {{
                     return {{ url: logUrl, stack: entry.stack || null, type: 'fetch_hook',
                               method: entry.method, timestamp: entry.ts }};
@@ -288,6 +298,9 @@ async def get_request_initiator(request_id: int) -> dict:
             "url": result.get("url"),
             "initiator_stack": result.get("stack"),
             "initiator_type": source,
+            "match_confidence": "heuristic" if result.get("stack") else "unavailable",
+            "matching_basis": "hook_log_url",
+            "evidence_warning": "URL-based hook matching is not exact request attribution; corroborate repeated/concurrent requests with independent input evidence.",
             "source": source,
             "method": result.get("method"),
             "request_headers": result.get("headers"),
@@ -296,11 +309,11 @@ async def get_request_initiator(request_id: int) -> dict:
             "diagnostic": (
                 {
                     "likely_causes": [
-                        "hook registered after SDK (try reload_with_hooks)",
+                        "hook registered after SDK (try instrumentation reload)",
                         "request made inside a sync-loaded SDK interceptor",
                         "fetch_hook.js not injected",
                     ],
-                    "recommended_action": "Use reload_with_hooks() or inject hooks before navigate.",
+                    "recommended_action": "Use instrumentation(action='reload') or inject hooks before navigate.",
                 }
                 if source in ("unknown", None) else None
             ),
@@ -410,7 +423,7 @@ async def export_network_capture(
                 for field in ("request_headers", "response_headers"):
                     row[field] = {key: "[REDACTED]" for key in (row.get(field) or {})}
                 # Transport error strings can contain original URLs.
-                for field in ("failure", "headers_error", "body_error"):
+                for field in ("failure", "headers_error", "body_error", "request_post_data_error"):
                     if row.get(field):
                         row[field] = "[REDACTED]"
             rows.append(row)
@@ -431,5 +444,88 @@ async def export_network_capture(
         return {"status": "exported", "path": str(path), "count": len(rows),
                 "schema_version": 1, "redacted": not include_sensitive,
                 "capture": payload["capture"]}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+async def compare_network_requests(
+    request_ids: list[int],
+    include_headers: bool = True,
+    include_body: bool = True,
+    max_value_chars: int = 200,
+    max_fields: int = 100,
+) -> dict:
+    """Compare 2..10 captured requests without issuing requests or launching a browser.
+
+    Args:
+        request_ids: Distinct IDs from list_network_requests in this capture.
+        include_headers: Compare available request headers; incompleteness warns.
+        include_body: Compare exact request body text plus top-level JSON fields.
+        max_value_chars: Preview characters per value (0..2000); digests always
+            cover full values in canonical JSON. Each string also includes raw_utf8
+            byte length/SHA-256; use that for exact body byte checks. Results may
+            contain credentials; keep them private.
+        max_fields: Maximum changed rows and constant field names (1..200).
+
+    Returns:
+        Changed fields, constant names and completeness limits. Query duplicates,
+        value order and raw URL encoding are preserved. Missing differs from null.
+        A varying field is evidence, not proof that it participates in signing.
+    """
+    try:
+        if not 2 <= len(request_ids) <= 10 or len(set(request_ids)) != len(request_ids):
+            raise ValueError("request_ids must contain 2..10 distinct captured IDs")
+        if not 0 <= max_value_chars <= 2000 or not 1 <= max_fields <= 200:
+            raise ValueError("max_value_chars must be 0..2000 and max_fields 1..200")
+        by_id = {r["id"]: r for r in browser_manager._network_requests}
+        missing = [rid for rid in request_ids if rid not in by_id]
+        if missing:
+            return {"error": "Request IDs unavailable (cleared/evicted or wrong capture)", "missing_ids": missing}
+        from ..utils.network_evidence import compare_requests
+        return compare_requests([by_id[rid] for rid in request_ids], include_headers=include_headers,
+                                include_body=include_body, max_value_chars=max_value_chars, max_fields=max_fields)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+async def save_response_body(request_id: int, save_path: str, allow_partial: bool = False) -> dict:
+    """Save captured response bytes (JS/WASM/JSON/binary) without refetch/replay.
+
+    Args:
+        request_id: A captured ID with a completed body (capture_body=True).
+        save_path: New file path. Never overwrites existing files.
+        allow_partial: Explicitly permit a truncated body; default rejects it.
+
+    Returns:
+        Path, saved byte length, SHA-256 and partial flag. Bytes are Playwright's
+        decoded HTTP response body (not original compression/wire bytes). If the
+        body was missing or truncated, increase the capture limit and collect a
+        new sample intentionally; this tool never triggers a new request.
+    """
+    try:
+        entry = next((r for r in browser_manager._network_requests if r["id"] == request_id), None)
+        if entry is None:
+            return {"error": f"Request ID {request_id} not found"}
+        body = entry.get("response_body")
+        encoding = entry.get("response_body_encoding")
+        if body is None or encoding not in ("utf-8", "latin-1"):
+            return {"error": "Captured bytes unavailable; start capture_body=True before the operation and wait for body completion",
+                    "body_state": entry.get("body_state")}
+        partial = bool(entry.get("response_body_capture_truncated", entry.get("response_body_truncated", False)))
+        if partial and not allow_partial:
+            return {"error": "Captured body is truncated; use a new intentional capture or explicitly allow_partial",
+                    "partial": True, "original_bytes": entry.get("response_body_total_bytes")}
+        data = body.encode(encoding)
+        import hashlib
+        path = Path(save_path).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as stream:
+            stream.write(data)
+        return {"status": "saved", "request_id": request_id, "path": str(path),
+                "bytes_saved": len(data), "original_bytes": entry.get("response_body_total_bytes"),
+                "sha256": hashlib.sha256(data).hexdigest(), "partial": partial,
+                "content_type": (entry.get("response_headers") or {}).get("content-type")}
     except Exception as exc:
         return {"error": str(exc)}

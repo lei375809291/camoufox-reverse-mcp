@@ -21,6 +21,11 @@ mcp = SchemaCompatibleFastMCP(
     "and JSVMP bytecode analysis."
 )
 
+# FastMCP otherwise advertises the SDK package version in initialize.serverInfo.
+# Report this application's version consistently with check_environment.
+from . import __version__
+mcp._mcp_server.version = __version__
+
 browser_manager = BrowserManager()
 
 # v1.0.0: pure JS reverse-engineering toolkit (session/assertions removed)

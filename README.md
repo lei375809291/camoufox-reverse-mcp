@@ -25,6 +25,14 @@
 
 ---
 
+## v1.7.0：经多轮 Agent 实操的证据与诊断
+
+- 新增 `compare_network_requests`、`save_response_body`，保留原始请求语义并明确哈希/字节口径。
+- 环境检查按任务范围提示复用与失效，不默认清理已有证据；导航保留原始失败，快照有界等待与输出。
+- 三轮九个独立任务保留失败并反馈修正，最终一轮签名/WASM/分页全部通过独立验收。
+
+详情见 [v1.7.0](docs/releases/v1.7.0.md)、[公开研究与实操记录](docs/RESEARCH_AND_VALIDATION.md)。
+
 ## v1.6.0：通用采集与独立验签
 
 - 同 URL 并发响应按 Request 对象关联，完整采集 Cookie/Set-Cookie，并明确失败、淘汰、未完成任务和截断状态。

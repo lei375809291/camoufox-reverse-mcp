@@ -5,6 +5,8 @@ import base64
 import json as _json
 import os
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from ..server import browser_manager, mcp
 from ..utils.frames import list_frame_metadata
 
@@ -189,11 +191,10 @@ async def navigate(
         try:
             resp = await page.goto(url, wait_until=wait_until, timeout=30000)
         except Exception as e:
-            msg = str(e).lower()
-            if "timeout" in msg or "exceeded" in msg or "waiting" in msg:
+            if isinstance(e, (PlaywrightTimeoutError, asyncio.TimeoutError)):
                 warnings.append(f"goto timeout for '{wait_until}'; checking usability")
                 try:
-                    dom_ready = await page.evaluate("document.readyState")
+                    dom_ready = await asyncio.wait_for(page.evaluate("document.readyState"), timeout=3.0)
                     current_url = page.url
                     if dom_ready in ("interactive", "complete") and current_url != "about:blank":
                         warnings.append(f"page usable (readyState={dom_ready})")
@@ -204,7 +205,12 @@ async def navigate(
                 except Exception:
                     raise
             else:
-                raise
+                # goto logs often contain "waiting until load" even for refused
+                # connections. Preserve the original transport error rather than
+                # masking it with a failed readyState probe on an error page.
+                return {"error": str(e), "phase": "goto", "requested_url": url,
+                        "current_url": page.url,
+                        "guidance": "Inspect captured document failures and current page state; no automatic navigation replay was attempted."}
         initial_status = resp.status if resp else None
 
         reloaded = False
@@ -329,39 +335,81 @@ async def take_screenshot(full_page: bool = False, selector: str | None = None) 
 
 
 @mcp.tool()
-async def take_snapshot() -> dict:
-    """Get the accessibility tree of the current page (token-efficient)."""
+async def take_snapshot(timeout_ms: int = 5000, max_nodes: int = 1000) -> dict:
+    """Get a bounded accessibility tree, or a labelled DOM fallback.
+
+    Args:
+        timeout_ms: Maximum wait for snapshot collection (1..30000). A hung
+            error-page accessibility query returns an error without restarting
+            the browser or replaying navigation.
+        max_nodes: Maximum retained tree containers (1..5000). Depth is capped
+            at 16 and individual strings at 2000 characters; truncation is explicit.
+    """
+    if not 1 <= timeout_ms <= 30000 or not 1 <= max_nodes <= 5000:
+        return {"error": "timeout_ms must be 1..30000 and max_nodes 1..5000"}
     try:
         page = await browser_manager.get_active_page()
-        try:
-            snapshot = await page.accessibility.snapshot()
-        except AttributeError:
-            snapshot = await page.evaluate("""() => {
-                function walk(node) {
-                    if (!node) return null;
-                    const item = {};
-                    const tag = node.tagName ? node.tagName.toLowerCase() : '';
-                    const role = node.getAttribute ? (node.getAttribute('role') || tag) : '';
-                    if (role) item.role = role;
-                    const name = node.getAttribute ? (node.getAttribute('aria-label')
-                        || node.getAttribute('alt') || node.getAttribute('title')
-                        || (node.tagName === 'INPUT' ? node.getAttribute('placeholder') : '')
-                        || '') : '';
-                    if (name) item.name = name;
-                    if (['INPUT','TEXTAREA','SELECT'].includes(node.tagName)) item.value = node.value || '';
-                    const text = [], children = [];
-                    for (const child of (node.childNodes || [])) {
-                        if (child.nodeType === 3) { const t = child.textContent.trim(); if (t) text.push(t); }
-                        else if (child.nodeType === 1) { const c = walk(child); if (c) children.push(c); }
+        async def collect():
+            try:
+                return await page.accessibility.snapshot(), "accessibility"
+            except AttributeError:
+                return await page.evaluate("""(limit) => {
+                    let visited = 0;
+                    function walk(node, depth) {
+                        if (!node) return null;
+                        if (++visited > limit || depth > 16) return {truncated: true};
+                        const item = {};
+                        const tag = node.tagName ? node.tagName.toLowerCase() : '';
+                        const role = node.getAttribute ? (node.getAttribute('role') || tag) : '';
+                        if (role) item.role = role;
+                        const name = node.getAttribute ? (node.getAttribute('aria-label')
+                            || node.getAttribute('alt') || node.getAttribute('title')
+                            || (node.tagName === 'INPUT' ? node.getAttribute('placeholder') : '') || '') : '';
+                        if (name) item.name = name;
+                        if (['INPUT','TEXTAREA','SELECT'].includes(node.tagName)) item.value = node.value || '';
+                        const text = [], children = [];
+                        for (const child of (node.childNodes || [])) {
+                            if (visited >= limit) { item.truncated = true; break; }
+                            if (child.nodeType === 3) { const t = child.textContent.trim(); if (t) text.push(t); }
+                            else if (child.nodeType === 1) { const c = walk(child, depth + 1); if (c) children.push(c); }
+                        }
+                        if (text.length && !children.length) item.text = text.join(' ');
+                        if (children.length) item.children = children;
+                        return item;
                     }
-                    if (text.length && !children.length) item.text = text.join(' ');
-                    if (children.length) item.children = children;
-                    if (!item.role && !item.name && !item.text && !children.length) return null;
-                    return item;
-                }
-                return walk(document.body);
-            }""")
-        return {"snapshot": snapshot}
+                    return walk(document.body, 0);
+                }""", max_nodes), "dom_fallback"
+        snapshot, method = await asyncio.wait_for(collect(), timeout_ms / 1000)
+        remaining = max_nodes
+        truncated = False
+        def trim(value, depth=0):
+            nonlocal remaining, truncated
+            if isinstance(value, (dict, list)):
+                if remaining <= 0 or depth > 16:
+                    truncated = True
+                    return {"truncated": True}
+                remaining -= 1
+                if isinstance(value, dict):
+                    if value.get("truncated") is True:
+                        truncated = True
+                    return {key: trim(item, depth + 1) for key, item in value.items()}
+                result = []
+                for item in value:
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    result.append(trim(item, depth + 1))
+                return result
+            if isinstance(value, str) and len(value) > 2000:
+                truncated = True
+                return value[:2000]
+            return value
+        result = trim(snapshot)
+        return {"snapshot": result, "method": method, "truncated": truncated,
+                "limits": {"max_nodes": max_nodes, "max_depth": 16, "max_text_chars": 2000}}
+    except asyncio.TimeoutError:
+        return {"error": "Snapshot timed out; inspect get_page_info and captured network failures instead of repeating the same snapshot.",
+                "timeout_ms": timeout_ms, "automatic_retry": False}
     except Exception as e:
         return {"error": str(e)}
 
