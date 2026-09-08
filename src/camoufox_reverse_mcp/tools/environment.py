@@ -5,6 +5,7 @@ import importlib
 import hashlib
 import json
 import shutil
+from pathlib import Path
 from typing import Any
 
 from ..server import browser_manager, mcp
@@ -189,6 +190,9 @@ async def check_environment() -> dict:
                    "fingerprint_is_complete_state": False,
                    "invalidate_on": ["browser restart/disconnect", "target or frame changed", "SDK or signer changed", "auth state changed", "hook/trace mode changed", "relevant operation failed"],
                    "note": "Fingerprint is a scope hint, not proof of unchanged page/auth/SDK state. Refresh only the checks affected by an observed change."},
+        "javascript_parser": {"default": "esprima", "modern_backend": "acorn-8.15.0",
+                              "modern_available": shutil.which("node") is not None and (Path(__file__).parents[1] / "vendor" / "acorn.cjs").is_file(),
+                              "network_required": False, "executes_source": False},
         "task_readiness": {"browser_analysis": overall_ok,
                            "captured_evidence_review": True,
                            "node_signer": shutil.which("node") is not None},

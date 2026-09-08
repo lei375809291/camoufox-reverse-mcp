@@ -1,9 +1,8 @@
 """
 ast_rewriter.py - MCP-side JS AST rewriter for source-level JSVMP instrumentation.
 
-Uses esprima-python (pure Python, ES2017 coverage). Unlike the v0.4.x page-side
-Acorn approach, this runs entirely in the MCP process so it works on pages
-that block external CDNs (RS/AK 412 challenges).
+Uses esprima-python for ES2017 and bundled Acorn through local Node.js for
+modern syntax. No parser code is fetched into the page or evaluated remotely.
 
 Usage:
     from .ast_rewriter import ast_rewrite, INSTRUMENT_RUNTIME
@@ -27,11 +26,12 @@ from .js_rewriter import (  # reuse the same runtime preamble
 
 # ============ AST walker ============
 
-def _walk(node: Any, parent: Any, callback: Callable[[Any, Any], None]) -> None:
+def _walk(node: Any, parent: Any, callback: Callable[[Any, Any], Any]) -> None:
     """Depth-first walker over an esprima AST."""
     if node is None or not hasattr(node, 'type'):
         return
-    callback(node, parent)
+    if callback(node, parent) is False:
+        return
     try:
         attrs = vars(node)
     except TypeError:
@@ -50,6 +50,7 @@ def _walk(node: Any, parent: Any, callback: Callable[[Any, Any], None]) -> None:
 # Names that must never be tap-wrapped
 _SKIP_CALLEE_NAMES = frozenset({
     '__mcp_tap_get', '__mcp_tap_call', '__mcp_tap_method',
+    '__mcp_prepare_method',
     'require', 'eval',
 })
 
@@ -76,9 +77,9 @@ def ast_rewrite(
 
     Returns:
         (rewritten_source_with_runtime, stats) on success.
-        (None, stats) if parse failed — caller should fallback to regex.
+        (None, stats) if parse failed; callers must report the limitation rather than assume a regex fallback is safe.
     """
-    import esprima
+    from .js_parser import parse_source
 
     stats: dict[str, Any] = {
         "parsed": False, "edits": 0,
@@ -87,16 +88,53 @@ def ast_rewrite(
     }
 
     try:
-        parse_options = {"range": True, "tolerant": True}
-        if include_source_site:
-            parse_options["loc"] = True
-        tree = esprima.parseScript(src, options=parse_options)
+        tree, parser_backend = parse_source(src, locations=include_source_site)
+        stats["parser_backend"] = parser_backend
+        stats["source_type"] = getattr(tree, "sourceType", "script")
         stats["parsed"] = True
     except Exception as e:
         stats["error"] = f"parse_failed: {type(e).__name__}: {e}"
         return None, stats
 
     edits: list[dict] = []
+    # A MemberExpression can be an assignment reference several pattern levels
+    # below its enclosing assignment/loop. Protect the reference, while leaving
+    # computed keys, defaults and the base object's reads eligible for taps.
+    references: set[int] = set()
+
+    def mark_target(node):
+        if node is None:
+            return
+        kind = node.type
+        if kind == 'MemberExpression':
+            references.add(id(node))
+        elif kind == 'ObjectPattern':
+            for prop in node.properties:
+                mark_target(prop.argument if prop.type == 'RestElement' else prop.value)
+        elif kind == 'ArrayPattern':
+            for element in node.elements:
+                mark_target(element)
+        elif kind == 'AssignmentPattern':
+            mark_target(node.left)
+        elif kind == 'RestElement':
+            mark_target(node.argument)
+
+    def find_references(node, parent):
+        if node.type in ('AssignmentExpression', 'ForInStatement', 'ForOfStatement'):
+            mark_target(node.left)
+        elif node.type == 'UpdateExpression' or (
+            node.type == 'UnaryExpression' and node.operator == 'delete'
+        ):
+            mark_target(node.argument)
+
+    _walk(tree, None, find_references)
+
+    def expression(node):
+        value = src[node.range[0]:node.range[1]]
+        # Esprima ranges omit grouping parentheses. A comma expression must
+        # stay one helper argument / array element, not become several.
+        return f'({value})' if node.type == 'SequenceExpression' else value
+
     tag_lit = json.dumps(tag)
     prop_filter = set(filter_property_names) if filter_property_names else None
     obj_filter = set(filter_object_names) if filter_object_names else None
@@ -121,7 +159,33 @@ def ast_rewrite(
                 site["end_column"] = getattr(end, 'column', None)
         return site
 
+    def static_object_path(node):
+        kind = getattr(node, 'type', None)
+        if kind == 'Identifier':
+            return node.name
+        if kind == 'ThisExpression':
+            return 'this'
+        if kind == 'MemberExpression' and not getattr(node, 'optional', False):
+            base = static_object_path(node.object)
+            prop = node.property
+            name = getattr(prop, 'value', None) if node.computed else getattr(prop, 'name', None)
+            if base and isinstance(name, str) and name and (name.replace('$', '_').isidentifier()):
+                return base + '.' + name
+        return None
+
+    def matches_filters(member):
+        if prop_filter:
+            prop = member.property
+            name = getattr(prop, 'value', None) if member.computed else getattr(prop, 'name', None)
+            if not isinstance(name, str) or name not in prop_filter:
+                return False
+        if obj_filter and static_object_path(member.object) not in obj_filter:
+            return False
+        return True
+
     def emit_member_tap(node, parent):
+        if id(node) in references or node.object.type == 'Super':
+            return False
         pt = getattr(parent, 'type', None) if parent else None
         if pt == 'AssignmentExpression' and getattr(parent, 'left', None) is node:
             return False
@@ -133,6 +197,8 @@ def ast_rewrite(
             return False
         if pt == 'NewExpression' and getattr(parent, 'callee', None) is node:
             return False
+        if pt == 'TaggedTemplateExpression' and parent.tag is node:
+            return False
         if pt in ('ExportSpecifier', 'ImportSpecifier'):
             return False
 
@@ -141,13 +207,13 @@ def ast_rewrite(
         obj_range = getattr(obj, 'range', None)
         if obj_range is None:
             return False
-        obj_src = src[obj_range[0]:obj_range[1]]
+        obj_src = expression(obj)
 
         if node.computed:
             prop_range = getattr(prop, 'range', None)
             if prop_range is None:
                 return False
-            key_src = src[prop_range[0]:prop_range[1]]
+            key_src = expression(prop)
         else:
             name = getattr(prop, 'name', None)
             if name is None:
@@ -158,27 +224,8 @@ def ast_rewrite(
         if node_range is None:
             return False
 
-        # v1.0.1: selective filtering for large files
-        if prop_filter or obj_filter:
-            # Extract property name for filtering
-            if node.computed:
-                # For computed access obj[key], check if key is a string literal
-                prop_type = getattr(prop, 'type', None)
-                if prop_type == 'Literal':
-                    prop_name = getattr(prop, 'value', None)
-                else:
-                    prop_name = None
-            else:
-                prop_name = getattr(prop, 'name', None)
-
-            # Extract object name for filtering
-            obj_type = getattr(obj, 'type', None)
-            obj_name = getattr(obj, 'name', None) if obj_type == 'Identifier' else None
-
-            if prop_filter and (prop_name is None or prop_name not in prop_filter):
-                return False
-            if obj_filter and (obj_name is None or obj_name not in obj_filter):
-                return False
+        if not matches_filters(node):
+            return False
 
         site = site_for(node, "tap_get", node_range)
         site_arg = f", {json.dumps(site['site_id'])}" if site else ""
@@ -199,23 +246,27 @@ def ast_rewrite(
             arange = getattr(a, 'range', None)
             if arange is None:
                 return False
-            args_parts.append(src[arange[0]:arange[1]])
+            args_parts.append(expression(a))
         args_src = "[" + ",".join(args_parts) + "]" if args_parts else "[]"
         node_range = getattr(node, 'range', None)
         if node_range is None:
             return False
 
         if ct == 'MemberExpression':
+            if not matches_filters(callee):
+                return False
             obj = callee.object
+            if obj.type == 'Super':
+                return False
             obj_range = getattr(obj, 'range', None)
             if obj_range is None:
                 return False
-            obj_src = src[obj_range[0]:obj_range[1]]
+            obj_src = expression(obj)
             if callee.computed:
                 prange = getattr(callee.property, 'range', None)
                 if prange is None:
                     return False
-                key_src = src[prange[0]:prange[1]]
+                key_src = expression(callee.property)
             else:
                 name = getattr(callee.property, 'name', None)
                 if name is None:
@@ -225,20 +276,22 @@ def ast_rewrite(
             site_arg = f", {json.dumps(site['site_id'])}" if site else ""
             edits.append({
                 "start": node_range[0], "end": node_range[1],
-                "replacement": f"__mcp_tap_method({obj_src}, {key_src}, {args_src}, {tag_lit}{site_arg})",
+                "replacement": f"__mcp_prepare_method({obj_src}, {key_src}, {tag_lit}{site_arg})({args_src})",
                 "kind": "method",
                 "source_site": site,
             })
             return True
         elif ct == 'Identifier':
+            if prop_filter or obj_filter:
+                return False
             fn_name = getattr(callee, 'name', None)
             if fn_name is None or fn_name in _SKIP_CALLEE_NAMES:
                 return False
             site = site_for(node, "tap_call", node_range)
-            site_arg = f", {json.dumps(site['site_id'])}" if site else ""
+            site_arg = f", {json.dumps(site['site_id'])}" if site else ", void 0"
             edits.append({
                 "start": node_range[0], "end": node_range[1],
-                "replacement": f"__mcp_tap_call({fn_name}, null, {args_src}, {tag_lit}{site_arg})",
+                "replacement": f"__mcp_tap_call({fn_name}, void 0, {args_src}, {tag_lit}{site_arg}, {json.dumps(fn_name)})",
                 "kind": "call",
                 "source_site": site,
             })
@@ -246,9 +299,30 @@ def ast_rewrite(
         return False
 
     def on_node(node, parent):
+        # Fail closed if a future parser emits these node shapes. Optional
+        # chains carry short-circuit state, and private names are not keys.
+        ntype = node.type
+        member = node.callee if ntype in ('CallExpression', 'OptionalCallExpression') else node
+        special_member = getattr(member, 'type', None) in ('MemberExpression', 'OptionalMemberExpression')
+        private_or_super = special_member and (
+            getattr(member.object, 'type', None) == 'Super'
+            or getattr(member.property, 'type', None) in ('PrivateIdentifier', 'PrivateName')
+        )
+        if (ntype in ('ChainExpression', 'OptionalMemberExpression', 'OptionalCallExpression')
+                or getattr(node, 'optional', False)
+                or getattr(member, 'optional', False)
+                or private_or_super):
+            stats["skipped"] += 1
+            stats.setdefault("semantic_skips", []).append("optional_private_or_super")
+            return False
+        # Identifier calls inside `with` may carry an implicit object receiver.
+        # Without lexical resolution a bare-call rewrite cannot retain it.
+        if node.type == 'WithStatement':
+            stats["skipped"] += 1
+            stats.setdefault("semantic_skips", []).append("with_statement")
+            return False
         if len(edits) >= max_edits:
             return
-        ntype = node.type
         if ntype == 'MemberExpression' and rewrite_member_access:
             if emit_member_tap(node, parent):
                 stats["member_edits"] += 1
@@ -296,4 +370,17 @@ def ast_rewrite(
         out = out[:e["start"]] + e["replacement"] + out[e["end"]:]
 
     stats["edits"] = len(edits)
-    return INSTRUMENT_RUNTIME + "\n" + out, stats
+    # Keep the original directive prologue active (also when terminated by ASI).
+    directive_end = (src.find("\n") + 1 if "\n" in src else len(src)) if src.startswith("#!") else 0
+    for statement in tree.body:
+        expr = getattr(statement, 'expression', None)
+        # esprima-python drops directive annotations after an empty string.
+        # Recognize unparenthesized string statements from their source ranges.
+        if not (statement.type == 'ExpressionStatement'
+                and getattr(expr, 'type', None) == 'Literal'
+                and isinstance(expr.value, str)
+                and statement.range[0] == expr.range[0]):
+            break
+        directive_end = statement.range[1]
+    return (out[:directive_end] + ";\n" + INSTRUMENT_RUNTIME + "\n"
+            + out[directive_end:]), stats

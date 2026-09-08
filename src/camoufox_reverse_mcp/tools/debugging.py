@@ -5,7 +5,7 @@ from ..utils.frames import resolve_frame
 from ..utils.worlds import evaluate_in_world
 
 
-def _build_evaluate_script(expression: str, await_promise: bool, world: str) -> str:
+def _build_evaluate_script(expression: str, await_promise: bool, world: str, result_format: str = "auto") -> str:
     """Build one self-contained evaluator for the selected Firefox world."""
     if world not in {"isolated", "main"}:
         raise ValueError("world must be 'isolated' or 'main'")
@@ -15,6 +15,22 @@ def _build_evaluate_script(expression: str, await_promise: bool, world: str) -> 
         if await_promise
         else f"(() => {{ return {expression}; }})()"
     )
+    if result_format == "json_ascii":
+        body = f"""
+            try {{
+                const r = {invocation};
+                const encoded = JSON.stringify(r);
+                if (encoded === undefined) return {{error:'Result has no JSON representation; return a tagged value explicitly',type:'error'}};
+                let ascii = '';
+                for (let i = 0; i < encoded.length; i++) {{
+                    const unit = encoded.charCodeAt(i);
+                    ascii += unit >= 32 && unit <= 126 ? encoded[i]
+                        : String.fromCharCode(92) + 'u' + ('0000' + unit.toString(16)).slice(-4);
+                }}
+                return {{result:ascii,type:typeof r,json_ascii:true}};
+            }} catch(e) {{return {{error:e && e.message ? e.message : String(e),type:'error'}};}}
+        """
+        return ("async " if await_promise else "") + "() => {" + body + "}"
     body = f"""
         try {{
             const r = {invocation};
@@ -99,15 +115,18 @@ async def evaluate_js(
     frame_url: str | None = None,
     frame_name: str | None = None,
     frame_index: int | None = None,
+    result_format: str = "auto",
 ) -> dict:
     """Execute an arbitrary JavaScript expression in the page context and return the result.
 
     v1.0.1 fix: correctly handles undefined/null/void/Symbol return values
     without triggering JSON.parse crashes.
 
-    Return value is aggressively cleaned (strips BOM, fixes lone surrogates,
-    trims whitespace, auto-parses JSON strings). If direct evaluate fails
-    with serialization error, automatically falls back to evaluate_handle.
+    Default auto mode preserves legacy cleaning and smart JSON parsing; it may
+    strip BOM/whitespace and replace lone surrogates. value_raw is not a
+    code-unit-preserving transport.
+    json_ascii returns explicit JSON text before transport/cleaning, preserving
+    JSON string code units. Evaluation is never replayed after a failure.
 
     Args:
         expression: JavaScript expression. Must be a single expression, not
@@ -121,6 +140,10 @@ async def evaluate_js(
         frame_url: Optional exact frame URL or shell-style wildcard.
         frame_name: Optional exact frame name or shell-style wildcard.
         frame_index: Optional zero-based index from get_page_info().frames.
+        result_format: "auto" (legacy cleanup) or "json_ascii" (ASCII JSON text
+            in value, not parsed/trimmed). json_ascii follows JSON.stringify:
+            tag non-finite numbers/-0/undefined explicitly if their distinction
+            matters; it is not a lossless arbitrary-object graph serializer.
 
     Returns:
         dict with keys:
@@ -212,6 +235,8 @@ async def evaluate_js(
         return s, f"all JSON parse strategies failed: {e1_msg}"
 
     try:
+        if result_format not in ("auto", "json_ascii"):
+            return _decorate(_build_error_response("result_format must be auto or json_ascii"))
         page = await browser_manager.get_active_page()
         target, frame_info = resolve_frame(
             page,
@@ -226,45 +251,13 @@ async def evaluate_js(
             # New approach: check typeof first, only JSON-roundtrip for object/array.
             raw, execution_backend, execution_warning = await evaluate_in_world(
                 target,
-                _build_evaluate_script(expression, await_promise, world),
+                _build_evaluate_script(expression, await_promise, world, result_format),
                 world,
             )
         except Exception as e:
-            msg = str(e)
-            low = msg.lower()
-            if world == "isolated" and any(
-                kw in low
-                for kw in ("unexpected", "serialize", "cloneable", "circular", "cyclic")
-            ):
-                try:
-                    handle = await target.evaluate_handle(expression)
-                    descr = await handle.evaluate(
-                        "obj => ({"
-                        "  type: typeof obj,"
-                        "  ctor: obj && obj.constructor ? obj.constructor.name : null,"
-                        "  keys: obj && typeof obj === 'object' ? "
-                        "        Object.keys(obj).slice(0, 40) : null,"
-                        "  preview: (function(){"
-                        "    try { var s = JSON.stringify(obj); "
-                        "          return s ? s.substring(0, 500) : String(obj).substring(0, 500); }"
-                        "    catch(e) { return String(obj).substring(0, 500); }"
-                        "  })()"
-                        "})"
-                    )
-                    try:
-                        await handle.dispose()
-                    except Exception:
-                        pass
-                    return _decorate({
-                        "type": "handle_fallback",
-                        "value": descr,
-                        "warnings": [f"direct evaluate failed, used handle fallback: {msg[:200]}"],
-                    })
-                except Exception as e2:
-                    return _decorate(
-                        _build_error_response(f"both paths failed: {msg[:200]} / {e2}")
-                    )
-            raise
+            return _decorate(_build_error_response(
+                str(e) + " (expression was not replayed; inspect state before retrying)"
+            ))
 
         if isinstance(raw, dict) and "error" in raw:
             return _decorate(_build_error_response(raw["error"]))
@@ -276,6 +269,14 @@ async def evaluate_js(
         js_type = raw.get("type") if isinstance(raw, dict) else None
         js_value_type = js_type
         warnings_list: list[str] = []
+
+        if result_format == "json_ascii":
+            if not isinstance(result_val, str) or not raw.get("json_ascii"):
+                return _decorate(_build_error_response("ASCII JSON transport did not return its result marker; expression was not replayed"))
+            return _decorate({"type":"json_ascii", "value":result_val,
+                              "encoding":"ASCII JSON text",
+                              "json_semantics":"JSON.stringify; explicitly tag special numbers/undefined when needed",
+                              "warnings":None})
 
         number_special = raw.get("number_special") if isinstance(raw, dict) else None
         number_special_value = number_special

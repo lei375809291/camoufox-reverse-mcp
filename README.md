@@ -20,9 +20,18 @@
 - Juggler 隔离减少部分页面侧自动化痕迹；Hook、环境差异与时序仍可能被观察
 - BrowserForge 按 **真实世界流量统计分布** 生成指纹，不是随机拼凑
 - 可用于反爬与环境依赖分析；具体站点的可用性必须通过实际样本验证
-- Hook 使用 `Object.defineProperty` **防覆盖保护**，页面脚本无法恢复原始方法
+- Hook 可选 `Object.defineProperty` 防覆盖保护；锁定属性可能需要重建 Context 才能恢复
 
 ---
+
+## v1.8.0：真实源码实操与观测语义修复
+
+- 真实 KProtect VM、javascript-obfuscator CFF、CryptoJS/FingerprintJS 多轮本地实操；失败反馈进入修复与复验。
+- 插桩保留异常、this 和求值顺序，主世界/Frame 日志可读；本地 Acorn 支持现代语法，保守跳过不安全改写。
+- 精确字符串可选 `evaluate_js(result_format="json_ascii")`；低副作用函数日志可选 `hook_function(serialization="preview")`，同步异常有明确记录。
+- 动态脚本按当前响应处理，不因改写失败重放请求；原生快照明确当前页面与世界。
+
+详情见 [v1.8.0](docs/releases/v1.8.0.md)、[真实源码与验证](docs/REAL_SOURCE_VALIDATION.md)。
 
 ## v1.7.0：经多轮 Agent 实操的证据与诊断
 

@@ -134,7 +134,7 @@ async def test_instrumentation_log_returns_source_sidecar_and_hot_functions(monk
 
     class FakePage:
         async def evaluate(self, expression):
-            if expression == "window.__mcp_vmp_log || []":
+            if "__mcp_vmp_log" in expression:
                 return [
                     {
                         "type": "tap_call",
@@ -209,7 +209,7 @@ async def test_instrumentation_route_registers_original_source_sidecar(monkeypat
         request = FakeRequest()
         fulfilled = None
 
-        async def fetch(self):
+        async def fetch(self, **kwargs):
             return FakeResponse()
 
         async def fulfill(self, **kwargs):
@@ -306,7 +306,7 @@ async def test_log_resolves_truncated_hot_sites_after_route_stop(monkeypatch):
 
     class FakePage:
         async def evaluate(self, expression):
-            assert expression == "window.__mcp_vmp_log || []"
+            assert "__mcp_vmp_log" in expression
             return [
                 {"type": "tap_get", "key": "hot", "site_id": hot_site},
                 {"type": "tap_get", "key": "hot", "site_id": hot_site},
@@ -353,7 +353,7 @@ async def test_stop_preserves_source_site_registry_for_final_log(monkeypatch):
 
     class FakePage:
         async def evaluate(self, expression):
-            assert expression == "window.__mcp_vmp_log || []"
+            assert "__mcp_vmp_log" in expression
             return [{"type": "tap_get", "key": "userAgent", "site_id": site_id}]
 
     async def get_active_page():

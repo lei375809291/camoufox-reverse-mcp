@@ -11,8 +11,11 @@ See https://github.com/WhiteNightShadow/camoufox-reverse-mcp/issues/3
 """
 from __future__ import annotations
 import time
+import hashlib
 
 from ..server import mcp, browser_manager
+from ..utils.worlds import evaluate_in_world
+from ..utils.frames import resolve_frame
 from ..utils.js_rewriter import (
     regex_rewrite,
     INSTRUMENT_RUNTIME,
@@ -68,6 +71,9 @@ async def instrumentation(
     max_file_size: int = 200_000,
     on_oversized: str = "selective",
     include_source_site: bool = False,
+    frame_url: str | None = None,
+    frame_name: str | None = None,
+    frame_index: int | None = None,
 ) -> dict:
     """JSVMP source-level instrumentation (v0.9.0 unified).
 
@@ -87,7 +93,8 @@ async def instrumentation(
           "status"  — show active instrumentations and stats.
                       (was: get_instrumentation_status)
         url_pattern: For "install"/"stop" — glob pattern matching VMP script URLs.
-        mode: For "install" — "ast" (default) or "regex".
+        mode: For "install" — "ast" (esprima then local bundled Acorn) or
+            "regex" (conservative whole-program subset; unsupported input skipped).
         tag: For "install"/"log" — group identifier.
         rewrite_member_access: For "install" — tap obj[key] reads.
         rewrite_calls: For "install" — tap fn(args) calls.
@@ -95,7 +102,8 @@ async def instrumentation(
             monotonic seq to tap events, plus an original-source range map in
             the log response. Default False.
         max_rewrites: For "install" — hard cap on rewrites per file.
-        fallback_on_error: For "install" — auto-fallback to regex if AST fails.
+        fallback_on_error: For "install" — try conservative regex on AST failure
+            only without property/object filters; otherwise pass through unchanged.
         ignore_csp: For "install" — skip CSP pre-flight check.
         clear_log: For "reload" — clear JSVMP logs before reload.
         wait_until: For "reload" — "load" / "domcontentloaded" / "networkidle".
@@ -103,12 +111,17 @@ async def instrumentation(
         type_filter: For "log" — "tap_get", "tap_call", "tap_method", "tap_call_err".
         key_filter: For "log" — substring match on property/method name.
         limit: For "log" — max entries to return.
-        clear: For "log" — clear log after retrieval.
-        filter_property_names: For "install" — only rewrite access to these
+        clear: For "log" — clear log after retrieval in the selected main world.
+        frame_url: For log; select a target frame by URL pattern.
+        frame_name: For log; select a target frame by name.
+        frame_index: For log; current frame snapshot index, not a persistent identity.
+            Source scripts run in the main world; logs are always read there.
+        filter_property_names: For AST "install" — only rewrite reads/methods of these
             property names (e.g. ['userAgent', 'platform', 'webdriver']).
             Dramatically reduces overhead for large files like webmssdk.
-        filter_object_names: For "install" — only rewrite when base object
-            matches (e.g. ['navigator', 'screen', 'document']).
+        filter_object_names: For AST "install" — only rewrite when the static base
+            object path matches (e.g. ['navigator', 'this.bytecode']). Dynamic
+            object identity is not inferred. Regex mode rejects nonempty filters.
         max_file_size: For "install" — files larger than this (bytes) trigger
             on_oversized behavior. Default 200KB.
         on_oversized: For "install" — "selective" (require filters), "skip",
@@ -145,7 +158,7 @@ async def instrumentation(
             include_source_site=include_source_site,
         )
     elif action == "log":
-        return await _get_log(tag_filter, type_filter, key_filter, limit, clear)
+        return await _get_log(tag_filter, type_filter, key_filter, limit, clear, frame_url, frame_name, frame_index)
     elif action == "stop":
         return await _stop(url_pattern or None)
     elif action == "reload":
@@ -165,6 +178,12 @@ def _get_status() -> dict:
                 "total_edits": info["stats"]["total_edits"],
                 "last_url": info["stats"]["last_url"],
                 "last_mode_used": info["stats"]["last_mode_used"],
+                "files_seen": info["stats"].get("files_seen", 0),
+                "files_passed_through": info["stats"].get("files_passed_through", 0),
+                "cache_hits": info["stats"].get("cache_hits", 0),
+                "last_parser_backend": info["stats"].get("last_parser_backend"),
+                "last_skip_reason": info["stats"].get("last_skip_reason"),
+                "last_error": info["stats"].get("last_error"),
                 "cached_urls": len(info["cache"]),
                 "include_source_site": info.get("include_source_site", False),
                 "source_site_count": len(info.get("source_sites", {})),
@@ -181,8 +200,12 @@ async def _install(url_pattern, mode, tag, rewrite_member_access,
                    max_file_size, on_oversized,
                    include_source_site=False) -> dict:
     try:
+        if mode not in ("ast", "regex") or on_oversized not in ("selective", "skip", "force"):
+            return {"error": "Invalid mode or on_oversized policy"}
         if not url_pattern:
             return {"error": "url_pattern is required for action='install'"}
+        if mode == "regex" and (filter_property_names or filter_object_names):
+            return {"error": "Property/object filters require mode='ast'; regex cannot preserve selective scope"}
 
         # v1.0.1: use context.route() instead of page.route() for timing
         ctx = browser_manager.contexts.get("default")
@@ -209,158 +232,120 @@ async def _install(url_pattern, mode, tag, rewrite_member_access,
         except Exception:
             pass
 
-        cache: dict[str, str] = {}
+        cache: dict[str, dict] = {}
         source_sites: dict[str, dict] = {}
         stats = {"files_rewritten": 0, "total_edits": 0, "last_url": None,
-                 "last_mode_used": None}
+                 "last_mode_used": None, "files_seen": 0, "files_passed_through": 0,
+                 "cache_hits": 0, "last_parser_backend": None, "last_skip_reason": None, "last_error": None}
 
         # Build filter sets for selective instrumentation
         prop_filter_set = set(filter_property_names) if filter_property_names else None
         obj_filter_set = set(filter_object_names) if filter_object_names else None
 
         async def route_handler(route):
+            resp = None
+            body_bytes = None
             try:
                 req_url = route.request.url
-                if req_url in cache:
-                    await route.fulfill(
-                        status=200,
-                        headers={"content-type": "application/javascript; charset=utf-8"},
-                        body=cache[req_url],
-                    )
-                    return
-                resp = await route.fetch()
+                stats["files_seen"] += 1
+                stats["last_url"] = req_url
+                stats["last_error"] = None
+                stats["last_skip_reason"] = None
+                # Obtain the current response exactly once. URL-only caches
+                # suppress cookies/status and silently reuse an old SDK revision.
+                resp = await route.fetch(max_redirects=0)
                 body_bytes = await resp.body()
+                headers = _clean_response_headers(resp.headers)
+                if not 200 <= resp.status < 300:
+                    stats["files_passed_through"] += 1
+                    stats["last_skip_reason"] = "non_success_response"
+                    await route.fulfill(status=resp.status, headers=headers, body=body_bytes)
+                    return
                 try:
                     src = body_bytes.decode("utf-8")
                 except UnicodeDecodeError:
                     src = body_bytes.decode("latin-1")
-
-                file_size = len(src.encode("utf-8"))
-                rewritten = src
-                edit_count = 0
-                mode_used = mode
-                rewrite_stats: dict = {}
-
-                # v1.0.1: large file handling
-                if file_size > max_file_size:
-                    if on_oversized == "skip":
-                        await route.fulfill(
-                            status=resp.status,
-                            headers=_clean_response_headers(resp.headers),
-                            body=src,
-                        )
-                        stats["last_url"] = req_url
-                        stats["last_mode_used"] = "skipped (oversized)"
+                digest = hashlib.sha256(body_bytes).hexdigest()
+                cached = cache.get(req_url)
+                if cached and cached["sha256"] == digest:
+                    stats["cache_hits"] += 1
+                    stats["last_mode_used"] = cached["mode"]
+                    stats["last_parser_backend"] = cached["parser_backend"]
+                    headers["content-type"] = "application/javascript; charset=utf-8"
+                    await route.fulfill(status=resp.status, headers=headers, body=cached["body"])
+                    return
+                if len(body_bytes) > max_file_size:
+                    skip = on_oversized == "skip" or (on_oversized == "selective" and not (prop_filter_set or obj_filter_set))
+                    if skip:
+                        stats["files_passed_through"] += 1
+                        stats["last_mode_used"] = "passthrough"
+                        stats["last_skip_reason"] = "oversized_without_selected_properties" if on_oversized == "selective" else "oversized"
+                        await route.fulfill(status=resp.status, headers=headers, body=body_bytes)
                         return
-                    elif on_oversized == "selective":
-                        if not prop_filter_set:
-                            # Can't do selective without filters, pass through
-                            await route.fulfill(
-                                status=resp.status,
-                                headers=_clean_response_headers(resp.headers),
-                                body=src,
-                            )
-                            stats["last_url"] = req_url
-                            stats["last_mode_used"] = "skipped (oversized, no filters)"
-                            return
-                        # Selective: use filtered AST rewrite
-                        ast_out, ast_stats = _ast_rewrite_py(
-                            src, tag=tag,
-                            rewrite_member_access=rewrite_member_access,
-                            rewrite_calls=rewrite_calls,
-                            max_edits=max_rewrites,
-                            filter_property_names=list(prop_filter_set) if prop_filter_set else None,
-                            filter_object_names=list(obj_filter_set) if obj_filter_set else None,
-                            include_source_site=include_source_site,
-                        )
-                        rewrite_stats = ast_stats
-                        if ast_out is not None:
-                            rewritten = ast_out
-                            edit_count = ast_stats.get("edits", 0)
-                            mode_used = "ast (selective)"
-                        elif fallback_on_error:
-                            mode_used = "regex (selective fallback)"
-                            rw, rstats = regex_rewrite(
-                                src, tag=tag,
-                                rewrite_member_access=rewrite_member_access,
-                                max_rewrites=max_rewrites,
-                                include_source_site=include_source_site,
-                            )
-                            rewrite_stats = rstats
-                            rewritten = rw
-                            edit_count = rstats.get("member_access_rewrites", 0)
-                    # else "force" — fall through to normal rewrite
-
-                # Normal rewrite (small files or force mode)
-                if rewritten is src:  # not yet rewritten
-                    if mode == "ast":
-                        ast_out, ast_stats = _ast_rewrite_py(
-                            src, tag=tag,
-                            rewrite_member_access=rewrite_member_access,
-                            rewrite_calls=rewrite_calls,
-                            max_edits=max_rewrites,
-                            filter_property_names=list(prop_filter_set) if prop_filter_set else None,
-                            filter_object_names=list(obj_filter_set) if obj_filter_set else None,
-                            include_source_site=include_source_site,
-                        )
-                        rewrite_stats = ast_stats
-                        if ast_out is not None:
-                            rewritten = ast_out
-                            edit_count = ast_stats.get("edits", 0)
-                        elif fallback_on_error:
+                rewritten = None
+                rewrite_stats = {}
+                mode_used = mode
+                if mode == "ast":
+                    rewritten, rewrite_stats = _ast_rewrite_py(
+                        src, tag=tag, rewrite_member_access=rewrite_member_access,
+                        rewrite_calls=rewrite_calls, max_edits=max_rewrites,
+                        filter_property_names=list(prop_filter_set) if prop_filter_set else None,
+                        filter_object_names=list(obj_filter_set) if obj_filter_set else None,
+                        include_source_site=include_source_site,
+                    )
+                    if rewritten is None:
+                        stats["last_error"] = rewrite_stats.get("error", "AST parse/rewrite failed")
+                        if fallback_on_error and not (prop_filter_set or obj_filter_set):
                             mode_used = "regex (fallback)"
-                            rw, rstats = regex_rewrite(
-                                src, tag=tag,
+                            rewritten, rewrite_stats = regex_rewrite(src, tag=tag,
                                 rewrite_member_access=rewrite_member_access,
-                                max_rewrites=max_rewrites,
-                                include_source_site=include_source_site,
-                            )
-                            rewrite_stats = rstats
-                            rewritten = rw
-                            edit_count = rstats.get("member_access_rewrites", 0)
-                    elif mode == "regex":
-                        rw, rstats = regex_rewrite(
-                            src, tag=tag,
-                            rewrite_member_access=rewrite_member_access,
-                            max_rewrites=max_rewrites,
-                            include_source_site=include_source_site,
-                        )
-                        rewrite_stats = rstats
-                        rewritten = rw
-                        edit_count = rstats.get("member_access_rewrites", 0)
-
+                                max_rewrites=max_rewrites, include_source_site=include_source_site)
+                elif mode == "regex":
+                    rewritten, rewrite_stats = regex_rewrite(src, tag=tag,
+                        rewrite_member_access=rewrite_member_access,
+                        max_rewrites=max_rewrites, include_source_site=include_source_site)
+                else:
+                    raise ValueError("mode must be ast or regex")
+                edit_count = rewrite_stats.get("edits", rewrite_stats.get("member_access_rewrites", 0))
+                stats["last_parser_backend"] = rewrite_stats.get("parser_backend")
+                if rewritten is None or not edit_count:
+                    stats["files_passed_through"] += 1
+                    stats["last_mode_used"] = "passthrough"
+                    stats["last_skip_reason"] = rewrite_stats.get("skipped_reason", "no_eligible_rewrites")
+                    await route.fulfill(status=resp.status, headers=headers, body=body_bytes)
+                    return
                 if include_source_site:
-                    source_id = rewrite_stats.get("source_id")
-                    source_sha256 = rewrite_stats.get("source_sha256")
                     for site in rewrite_stats.get("source_sites", []):
-                        metadata = {
-                            **site,
-                            "source_id": source_id,
-                            "source_sha256": source_sha256,
-                            "urls": [req_url],
-                            "offset_unit": "unicode_code_point",
-                            "range_semantics": "half_open",
-                        }
+                        metadata = {**site, "source_id": rewrite_stats.get("source_id"),
+                                    "source_sha256": rewrite_stats.get("source_sha256"),
+                                    "urls": [req_url], "offset_unit": "unicode_code_point",
+                                    "range_semantics": "half_open"}
                         existing = _source_site_registry.get(site["site_id"])
                         if existing:
-                            metadata["urls"] = list(dict.fromkeys(
-                                [*existing.get("urls", []), req_url]
-                            ))
+                            metadata["urls"] = list(dict.fromkeys([*existing.get("urls", []), req_url]))
                         source_sites[site["site_id"]] = metadata
                         _source_site_registry[site["site_id"]] = metadata
-
-                cache[req_url] = rewritten
+                if len(cache) >= 128 and req_url not in cache:
+                    cache.pop(next(iter(cache)))
+                cache[req_url] = {"sha256": digest, "body": rewritten,
+                                  "mode": mode_used, "parser_backend": stats["last_parser_backend"]}
                 stats["files_rewritten"] += 1
                 stats["total_edits"] += edit_count
-                stats["last_url"] = req_url
                 stats["last_mode_used"] = mode_used
-
-                headers = _clean_response_headers(resp.headers)
                 headers["content-type"] = "application/javascript; charset=utf-8"
                 await route.fulfill(status=resp.status, headers=headers, body=rewritten)
-            except Exception as e:
+            except Exception as exc:
+                stats["last_error"] = str(exc)
+                # Never continue_ after route.fetch: that could execute a POST
+                # twice. Preserve the original response or fail this request.
                 try:
-                    await route.continue_()
+                    if resp is not None and body_bytes is not None:
+                        stats["files_passed_through"] += 1
+                        await route.fulfill(status=resp.status,
+                                            headers=_clean_response_headers(resp.headers),
+                                            body=body_bytes)
+                    else:
+                        await route.abort("failed")
                 except Exception:
                     pass
 
@@ -389,10 +374,17 @@ async def _install(url_pattern, mode, tag, rewrite_member_access,
         return {"error": str(e)}
 
 
-async def _get_log(tag_filter, type_filter, key_filter, limit, clear) -> dict:
+async def _get_log(tag_filter, type_filter, key_filter, limit, clear, frame_url=None, frame_name=None, frame_index=None) -> dict:
     try:
         page = await browser_manager.get_active_page()
-        data = await page.evaluate("window.__mcp_vmp_log || []")
+        if not 1 <= limit <= 20000:
+            return {"error": "limit must be between 1 and 20000"}
+        target, frame = (resolve_frame(page, frame_url=frame_url, frame_name=frame_name, frame_index=frame_index)
+                         if any(value is not None for value in (frame_url, frame_name, frame_index)) else (page, None))
+        data, backend, warning = await evaluate_in_world(target, "() => window.__mcp_vmp_log || []", "main")
+        if not isinstance(data, list):
+            return {"error": "Instrumentation log is not an array in the selected main world"}
+        raw_count = len(data)
         if tag_filter:
             data = [d for d in data if d.get("tag") == tag_filter]
         if type_filter:
@@ -442,9 +434,13 @@ async def _get_log(tag_filter, type_filter, key_filter, limit, clear) -> dict:
         unresolved_site_ids = sorted(wanted_site_ids - set(source_site_map))
 
         if clear:
-            await page.evaluate("window.__mcp_vmp_log = []")
+            await evaluate_in_world(target, "() => {window.__mcp_vmp_log = []; return true;}", "main")
         result = {
             "entries": entries,
+            "world": "main", "frame": frame, "execution_backend": backend,
+            "warning": warning, "raw_total_entries": raw_count,
+            "possibly_capped": raw_count >= 20000,
+            "capture_limit": 20000,
             "total_entries": len(data), "returned": min(len(data), limit),
             "truncated": len(data) > limit,
             "summary": {

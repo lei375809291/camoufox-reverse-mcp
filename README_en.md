@@ -20,9 +20,19 @@ An MCP (Model Context Protocol) server that gives AI coding assistants (Claude C
 - Juggler protocol isolation reduces page-world automation artifacts
 - BrowserForge generates fingerprints based on **real-world traffic distribution**
 - Supports investigation of protected applications; success must be verified for each target and is not guaranteed by the browser choice
-- Hooks use `Object.defineProperty` with **override protection**
+- Optional hook override protection uses `Object.defineProperty`; locked properties may require a new context to restore
 
 ---
+
+## v1.8.0: Real Upstream Cases and Observation Semantics
+
+- Real KProtect VM, javascript-obfuscator CFF, CryptoJS and FingerprintJS cases drive fixes and independent retesting through MCP stdio and local services.
+- Source taps preserve evaluation order and exceptions, use primitive previews, and expose main-world/frame logs. Bundled Acorn adds optional local Node parsing; unsupported transformations are skipped conservatively.
+- `evaluate_js(result_format="json_ascii")` returns explicit ASCII JSON text. Tag special numbers/undefined yourself; default `auto` keeps legacy cleanup.
+- `hook_function(serialization="preview")` avoids inspecting user objects. `outcome`/`thrownValue` record synchronous throws; `completion="sync"` never claims Promise settlement. Default JSON serialization remains available and may invoke getters/toJSON.
+- Routes use the current response and do not replay requests after rewrite failure. Native snapshot metadata identifies the active page/main frame, not the event window or event-time value.
+
+See [release notes](docs/releases/v1.8.0.md), [actual validation and limits](docs/REAL_SOURCE_VALIDATION.md), and the companion Skill's [reproducible case CLI](https://github.com/WhiteNightShadow/hello_js_reverse_skill/tree/v3.9.0/scripts/real_cases). These are local simulations, not commercial anti-bot success claims.
 
 ## v1.7.0: Evidence and Diagnostics Validated by Independent Agents
 

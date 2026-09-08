@@ -2,92 +2,129 @@
 js_rewriter.py - JS 源码插桩改写器。
 
 提供两个模式:
-  regex_rewrite:  纯正则实现,快且无外部依赖,覆盖率 ~80% (对压缩/混淆 VMP 代码够用)
-  ast_rewrite:    通过页面内 Acorn 做精确 AST 改写,覆盖率 ~99%,需要能访问 CDN
+  regex_rewrite:  无依赖的保守语法子集；无法证明上下文安全时原样跳过。
+  ast_rewrite:    MCP 侧 esprima AST 改写（见 ast_rewriter.py）。
 
-所有改写都会在文件开头插入 __mcp_tap_get / __mcp_tap_call 的运行时定义,
+无全量语义等价或覆盖率承诺。日志只预览 primitive，对象/函数使用类型占位；
+源码/堆栈/耗时及 MCP 全局名称仍可被观察，运行时应在业务修改内建函数前安装。
+
+实际改写会在原 directive prologue 后插入 __mcp_tap_get / __mcp_tap_call 的运行时定义,
 并通过 window.__mcp_vmp_log 输出。
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import Tuple
 
 
 INSTRUMENT_RUNTIME = r"""
 (function(){
+  'use strict';
   if (window.__mcp_tap_installed) return;
   window.__mcp_tap_installed = true;
   window.__mcp_vmp_log = window.__mcp_vmp_log || [];
+  // Capture intrinsics once; never consult a target function's .apply/.name.
+  var apply = Reflect.apply;
+  var arrayPush = Array.prototype.push;
+  var stringSlice = String.prototype.slice;
+  var stringIndexOf = String.prototype.indexOf;
+  var stringifyPrimitive = String;
+  var now = Date.now;
   var CAP = 20000;
   var siteSeq = 0;
+  var sampleCredit = 0;
   window.__mcp_tap_cfg = window.__mcp_tap_cfg || { sampling: 1, tagFilter: null };
   function _push(e, siteId){
-    if (window.__mcp_vmp_log.length >= CAP) return;
+    var log = window.__mcp_vmp_log;
+    if (log.length >= CAP) return;
     if (typeof siteId === 'string' && siteId) {
       e.site_id = siteId;
       e.seq = siteSeq++;
     }
-    e.ts = Date.now();
-    window.__mcp_vmp_log.push(e);
+    e.ts = now();
+    apply(arrayPush, log, [e]);
   }
-  function _tag(t){
-    var f = window.__mcp_tap_cfg.tagFilter;
-    if (!f) return true;
-    return (t||'').indexOf(f) !== -1;
+  function _enabled(tag, error){
+    var cfg = window.__mcp_tap_cfg;
+    var f = cfg.tagFilter;
+    if (f && (typeof f !== 'string' || typeof tag !== 'string' ||
+              apply(stringIndexOf, tag, [f]) === -1)) return false;
+    if (error) return true; // Preserve the existing unsampled call-error event.
+    var sampling = cfg.sampling;
+    if (typeof sampling !== 'number' || !(sampling > 0)) return false;
+    if (sampling >= 1) return true;
+    // Deterministic sampling has no access to the program's random stream.
+    sampleCredit += sampling;
+    if (sampleCredit < 1) return false;
+    sampleCredit -= 1;
+    return true;
   }
   function _preview(v){
-    try {
-      if (v === null) return 'null';
-      if (v === undefined) return 'undefined';
-      var t = typeof v;
-      if (t === 'function') return '[fn ' + (v.name || '') + ']';
-      if (t === 'object') {
-        var s = JSON.stringify(v);
-        return s && s.length > 120 ? s.substr(0, 120) + '...' : s;
-      }
-      var s2 = String(v);
-      return s2.length > 120 ? s2.substr(0, 120) + '...' : s2;
-    } catch (e) { return '[err]'; }
+    if (v === null) return 'null';
+    var t = typeof v;
+    // No enumeration, constructor/name, toJSON or user-defined coercion.
+    if (t === 'object') return '[object]';
+    if (t === 'function') return '[fn]';
+    var s = stringifyPrimitive(v);
+    return s.length > 120 ? apply(stringSlice, s, [0, 120]) + '...' : s;
   }
-  window.__mcp_tap_get = function(obj, key, tag, siteId){
-    var val;
-    try { val = obj[key]; } catch (e) { val = undefined; }
-    if (_tag(tag) && Math.random() < window.__mcp_tap_cfg.sampling){
-      _push({ type:'tap_get', tag: tag, key: String(key),
-              objType: obj && obj.constructor ? obj.constructor.name : typeof obj,
-              value: _preview(val) }, siteId);
-    }
-    return val;
-  };
-  window.__mcp_tap_call = function(fn, thisArg, args, tag, siteId){
+  function _getLog(obj, key, value, tag, siteId){
+    try {
+      if (_enabled(tag, false)) {
+        _push({ type:'tap_get', tag:tag, key:_preview(key),
+                objType:typeof obj, value:_preview(value) }, siteId);
+      }
+    } catch (ignored) {} // A broken log sink must not replace program results.
+  }
+  function _invoke(fn, thisArg, args, tag, siteId, name, method){
     var r;
-    try { r = fn.apply(thisArg, args); } catch (e) {
-      if (_tag(tag)) _push({ type:'tap_call_err', tag: tag,
-                             name: fn && fn.name || 'anon', err: String(e) }, siteId);
+    try { r = apply(fn, thisArg, args); } catch (e) {
+      try {
+        if (!method && _enabled(tag, true)) {
+          _push({ type:'tap_call_err', tag:tag, name:name, err:_preview(e) }, siteId);
+        }
+      } catch (ignored) {}
       throw e;
     }
-    if (_tag(tag) && Math.random() < window.__mcp_tap_cfg.sampling){
-      _push({ type:'tap_call', tag: tag, name: fn && fn.name || 'anon',
-              argc: args ? args.length : 0, arg0: args && args.length ? _preview(args[0]) : null,
-              ret: _preview(r) }, siteId);
-    }
+    try {
+      if (_enabled(tag, false)) {
+        var event = { type:method ? 'tap_method' : 'tap_call', tag:tag,
+                      argc:args.length, arg0:args.length ? _preview(args[0]) : null,
+                      ret:_preview(r) };
+        if (method) {
+          event.objType = typeof thisArg;
+          event.method = name;
+        } else {
+          event.name = name;
+        }
+        _push(event, siteId);
+      }
+    } catch (ignored) {}
     return r;
+  }
+  window.__mcp_tap_get = function(obj, key, tag, siteId){
+    var val = obj[key]; // Throw the original getter/coercion exception unchanged.
+    _getLog(obj, key, val, tag, siteId);
+    return val;
   };
-  window.__mcp_tap_method = function(obj, key, args, tag, siteId){
+  window.__mcp_tap_call = function(fn, thisArg, args, tag, siteId, name){
+    return _invoke(fn, thisArg, args, tag, siteId,
+                   typeof name === 'string' ? name : 'anon', false);
+  };
+  window.__mcp_prepare_method = function(obj, key, tag, siteId){
+    // This phase runs before argument evaluation, including spread/yield/await.
+    // Only the actual property read coerces key; previews never coerce objects.
     var fn = obj[key];
-    if (typeof fn !== 'function') return undefined;
-    var r = fn.apply(obj, args);
-    if (_tag(tag) && Math.random() < window.__mcp_tap_cfg.sampling){
-      _push({ type:'tap_method', tag: tag,
-              objType: obj && obj.constructor ? obj.constructor.name : typeof obj,
-              method: String(key),
-              argc: args ? args.length : 0,
-              arg0: args && args.length ? _preview(args[0]) : null,
-              ret: _preview(r) }, siteId);
-    }
-    return r;
+    return function(args){
+      return _invoke(fn, obj, args, tag, siteId, _preview(key), true);
+    };
+  };
+  // Legacy helper signature retained. Already-evaluated args cannot recover
+  // getter-before-arguments ordering; new rewrites use prepare_method instead.
+  window.__mcp_tap_method = function(obj, key, args, tag, siteId){
+    return window.__mcp_prepare_method(obj, key, tag, siteId)(args);
   };
 })();
 """
@@ -95,11 +132,46 @@ INSTRUMENT_RUNTIME = r"""
 
 # ============ Regex-based rewrite ============
 
-# Match:  identifier[expr]   -> __mcp_tap_get(identifier, expr, '<tag>')
-# Limitations: won't handle nested brackets perfectly. Good enough for minified code.
+# This is a whole-program whitelist, not a search/replace over arbitrary JS.
+# Only semicolon-separated primitive/identifier/bracket reads and initialized
+# single variable declarations are accepted. All other programs pass through.
+_IDENT = r'[A-Za-z_$][A-Za-z0-9_$]*'
+_STRING = r"\"(?:[^\"\\\r\n]|\\[^\r\n])*\"|'(?:[^'\\\r\n]|\\[^\r\n])*'"
+_ATOM = rf'(?:{_STRING}|[0-9]+|{_IDENT})'
 _MEMBER_BRACKET_RE = re.compile(
-    r'([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([^\[\]\n]{1,200}?)\s*\]'
+    rf'(?P<object>{_IDENT})\s*\[\s*(?P<key>{_ATOM})\s*\]'
 )
+_TRIVIA = r'(?:\s|/\*[^*]*\*+(?:[^/*][^*]*\*+)*/|//[^\r\n]*(?:\r?\n|$))*'
+_SIMPLE_STATEMENT_RE = re.compile(
+    rf'{_TRIVIA}(?P<declaration>(?:var|let|const)\s+{_IDENT}\s*=\s*)?'
+    rf'(?P<expression>{_MEMBER_BRACKET_RE.pattern}|{_ATOM})'
+    rf'{_TRIVIA}(?:;|$)'
+)
+_RESERVED = frozenset("""
+await break case catch class const continue debugger default delete do else
+export extends finally for function if import in instanceof let new return
+super switch this throw try typeof var void while with yield enum implements
+interface package private protected public static null true false
+""".split())
+_REGEX_BOUNDARY = (
+    "Only whole programs of simple reads and single initialized declarations "
+    "are recognized; calls, targets, operators, templates, regex literals and "
+    "other syntax are passed through unchanged. This is not general JS equivalence."
+)
+
+
+def _simple_statements(src: str) -> list[re.Match] | None:
+    statements = []
+    pos = 0
+    while pos < len(src):
+        if re.fullmatch(_TRIVIA, src[pos:]):
+            break
+        match = _SIMPLE_STATEMENT_RE.match(src, pos)
+        if match is None:
+            return None
+        statements.append(match)
+        pos = match.end()
+    return statements
 
 
 def source_identity(src: str) -> tuple[str, str]:
@@ -125,55 +197,59 @@ def _rewrite_member_access(
     include_source_site: bool = False,
     source_id: str = "",
 ) -> Tuple[str, int, list[dict]]:
-    count = 0
+    statements = _simple_statements(src)
+    if statements is None:
+        return src, 0, []
+    edits = []
     source_sites: list[dict] = []
-
-    def repl(m: re.Match) -> str:
-        nonlocal count
-        if count >= max_rewrites:
-            return m.group(0)
-        obj = m.group(1)
-        key = m.group(2)
-        # Heuristic: skip common safe cases
-        if obj in ('require', 'module', 'exports', 'console', '__mcp_tap_get',
-                   '__mcp_tap_call', '__mcp_tap_method', '_push', '_tag', '_preview'):
-            return m.group(0)
-        # Check if followed by `=` (assignment target)
-        end = m.end()
-        tail = src[end:end + 3]
-        if tail.lstrip().startswith('=') and not tail.lstrip().startswith('=='):
-            return m.group(0)
-        count += 1
+    for statement in statements:
+        if len(edits) >= max_rewrites:
+            break
+        match = _MEMBER_BRACKET_RE.fullmatch(statement.group('expression'))
+        if match is None:
+            continue
+        obj, key = match.group('object', 'key')
+        if obj in _RESERVED or obj in ('require', 'module', 'exports', 'console') or obj.startswith('__mcp_'):
+            continue
+        # Reserved tokens cannot stand for an object binding. Literal keys are
+        # fine; unsupported syntax is never transformed into newly valid code.
+        if key in _RESERVED and key not in ('null', 'true', 'false'):
+            continue
+        start, end = statement.span('expression')
         site_arg = ""
         if include_source_site:
-            site = build_source_site(source_id, "tap_get", m.start(), m.end())
+            site = build_source_site(source_id, "tap_get", start, end)
             source_sites.append(site)
-            site_arg = f",{repr(site['site_id'])}"
-        return f"__mcp_tap_get({obj},{key},{repr(tag)}{site_arg})"
-
-    new_src = _MEMBER_BRACKET_RE.sub(repl, src)
-    return new_src, count, source_sites
+            site_arg = f",{json.dumps(site['site_id'])}"
+        edits.append((start, end, f"__mcp_tap_get({obj},{key},{json.dumps(tag)}{site_arg})"))
+    for start, end, replacement in reversed(edits):
+        src = src[:start] + replacement + src[end:]
+    return src, len(edits), source_sites
 
 
 def regex_rewrite(src: str, tag: str = "vmp",
                   rewrite_member_access: bool = True,
                   max_rewrites: int = 5000,
                   include_source_site: bool = False) -> Tuple[str, dict]:
-    """Rewrite source with regex-based taps. Returns (new_src, stats)."""
-    stats = {"member_access_rewrites": 0}
+    """Conservative dependency-free fallback, with explicit semantic boundaries.
+
+    Unrecognized programs are returned byte-for-byte, without a preamble. In
+    particular modern syntax parse failures do not trigger heuristic rewrites.
+    """
+    statements = _simple_statements(src)
+    stats = {"member_access_rewrites": 0, "semantic_boundary": _REGEX_BOUNDARY}
+    if statements is None:
+        stats["skipped_reason"] = "unsupported_program_syntax"
     new_src = src
     source_id = ""
     source_sha256 = ""
     source_sites: list[dict] = []
     if include_source_site:
         source_id, source_sha256 = source_identity(src)
-    if rewrite_member_access:
+    if rewrite_member_access and statements is not None:
         new_src, n, source_sites = _rewrite_member_access(
-            new_src,
-            tag,
-            max_rewrites,
-            include_source_site=include_source_site,
-            source_id=source_id,
+            src, tag, max_rewrites,
+            include_source_site=include_source_site, source_id=source_id,
         )
         stats["member_access_rewrites"] = n
     if include_source_site:
@@ -182,7 +258,15 @@ def regex_rewrite(src: str, tag: str = "vmp",
             "source_sha256": source_sha256,
             "source_sites": source_sites,
         })
-    return INSTRUMENT_RUNTIME + "\n" + new_src, stats
+    if not stats["member_access_rewrites"]:
+        return src, stats
+    directive_end = 0
+    for statement in statements or []:
+        if statement.group('declaration') or not re.fullmatch(_STRING, statement.group('expression')):
+            break
+        directive_end = statement.end()
+    return (new_src[:directive_end] + ";\n" + INSTRUMENT_RUNTIME + "\n"
+            + new_src[directive_end:]), stats
 
 
 # ============ AST-based rewrite (via page-side Acorn) ============
@@ -213,67 +297,91 @@ async (src, tag, opts) => {
 
   const edits = [];
   const tagLit = JSON.stringify(tag);
-
-  function isAssignTarget(node, parent) {
-    return parent && parent.type === 'AssignmentExpression' && parent.left === node;
+  const references = new Set();
+  const skipNames = new Set(['eval', 'require', '__mcp_tap_get', '__mcp_tap_call',
+                             '__mcp_tap_method', '__mcp_prepare_method']);
+  const semanticSkips = [];
+  function walk(node, parent, visit) {
+    if (!node || typeof node.type !== 'string' || visit(node, parent) === false) return;
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'range') continue;
+      const val = node[key];
+      if (Array.isArray(val)) {
+        for (const child of val) walk(child, node, visit);
+      } else if (val && typeof val === 'object') walk(val, node, visit);
+    }
   }
-  function isUpdateTarget(node, parent) {
-    return parent && parent.type === 'UpdateExpression' && parent.argument === node;
+  function markTarget(node) {
+    if (!node) return;
+    if (node.type === 'MemberExpression') references.add(node);
+    else if (node.type === 'ObjectPattern') {
+      for (const p of node.properties) markTarget(p.type === 'RestElement' ? p.argument : p.value);
+    } else if (node.type === 'ArrayPattern') {
+      for (const e of node.elements) markTarget(e);
+    } else if (node.type === 'AssignmentPattern') markTarget(node.left);
+    else if (node.type === 'RestElement') markTarget(node.argument);
   }
-
-  acorn.walk.ancestor(ast, {
-    MemberExpression(node, state, ancestors) {
-      const parent = ancestors[ancestors.length - 2];
-      if (isAssignTarget(node, parent) || isUpdateTarget(node, parent)) return;
-      if (parent && parent.type === 'CallExpression' && parent.callee === node) {
-        return;
-      }
-      if (opts.rewriteMemberAccess) {
-        const objSrc = src.slice(node.object.start, node.object.end);
-        const keySrc = node.computed
-          ? src.slice(node.property.start, node.property.end)
-          : JSON.stringify(node.property.name);
-        edits.push({
-          start: node.start, end: node.end,
-          replacement: `__mcp_tap_get(${objSrc}, ${keySrc}, ${tagLit})`
-        });
-      }
-    },
-    CallExpression(node, state, ancestors) {
-      if (!opts.rewriteCalls) return;
+  walk(ast, null, node => {
+    if (['AssignmentExpression', 'ForInStatement', 'ForOfStatement'].includes(node.type)) markTarget(node.left);
+    if (node.type === 'UpdateExpression' ||
+        (node.type === 'UnaryExpression' && node.operator === 'delete')) markTarget(node.argument);
+  });
+  function expression(node) {
+    const value = src.slice(node.start, node.end);
+    return node.type === 'SequenceExpression' ? `(${value})` : value;
+  }
+  function keySource(node) {
+    return node.computed ? expression(node.property) : JSON.stringify(node.property.name);
+  }
+  walk(ast, null, (node, parent) => {
+    const member = node.type === 'CallExpression' ? node.callee : node;
+    if (node.type === 'WithStatement' || node.type === 'ChainExpression' ||
+        node.type === 'OptionalMemberExpression' || node.type === 'OptionalCallExpression' ||
+        node.optional || member.optional ||
+        (member.type === 'MemberExpression' &&
+         (member.object.type === 'Super' || ['PrivateIdentifier', 'PrivateName'].includes(member.property.type)))) {
+      semanticSkips.push(node.type);
+      return false;
+    }
+    if (node.type === 'MemberExpression' && opts.rewriteMemberAccess) {
+      if (references.has(node)) return;
+      if (parent && ((['CallExpression', 'NewExpression'].includes(parent.type) && parent.callee === node) ||
+                     (parent.type === 'TaggedTemplateExpression' && parent.tag === node))) return;
+      edits.push({start:node.start, end:node.end,
+                  replacement:`__mcp_tap_get(${expression(node.object)}, ${keySource(node)}, ${tagLit})`});
+    } else if (node.type === 'CallExpression' && opts.rewriteCalls) {
+      const argsSrc = '[' + node.arguments.map(expression).join(',') + ']';
       if (node.callee.type === 'MemberExpression') {
         const me = node.callee;
-        const objSrc = src.slice(me.object.start, me.object.end);
-        const keySrc = me.computed
-          ? src.slice(me.property.start, me.property.end)
-          : JSON.stringify(me.property.name);
-        const argsSrc = node.arguments.length
-          ? '[' + node.arguments.map(a => src.slice(a.start, a.end)).join(',') + ']'
-          : '[]';
-        edits.push({
-          start: node.start, end: node.end,
-          replacement: `__mcp_tap_method(${objSrc}, ${keySrc}, ${argsSrc}, ${tagLit})`
-        });
-      } else if (node.callee.type === 'Identifier') {
-        const fnSrc = src.slice(node.callee.start, node.callee.end);
-        const argsSrc = node.arguments.length
-          ? '[' + node.arguments.map(a => src.slice(a.start, a.end)).join(',') + ']'
-          : '[]';
-        edits.push({
-          start: node.start, end: node.end,
-          replacement: `__mcp_tap_call(${fnSrc}, null, ${argsSrc}, ${tagLit})`
-        });
+        edits.push({start:node.start, end:node.end,
+                    replacement:`__mcp_prepare_method(${expression(me.object)}, ${keySource(me)}, ${tagLit})(${argsSrc})`});
+      } else if (node.callee.type === 'Identifier' && !skipNames.has(node.callee.name)) {
+        const fn = expression(node.callee);
+        edits.push({start:node.start, end:node.end,
+                    replacement:`__mcp_tap_call(${fn}, void 0, ${argsSrc}, ${tagLit}, void 0, ${JSON.stringify(fn)})`});
       }
     }
   });
-
-  // Apply edits in reverse to preserve positions
-  edits.sort((a, b) => b.start - a.start);
-  let out = src;
+  // Keep only outer edits. Original source offsets cannot apply nested edits.
+  edits.sort((a, b) => a.start - b.start || b.end - a.end);
+  const kept = [];
   for (const e of edits) {
+    if (!kept.length || e.start >= kept[kept.length - 1].end) kept.push(e);
+  }
+  let out = src;
+  for (const e of kept.slice().reverse()) {
     out = out.slice(0, e.start) + e.replacement + out.slice(e.end);
   }
-
-  return { ok: true, src: out, edit_count: edits.length };
+  // This legacy template returns only the body. Expose the safe insertion point
+  // for callers installing INSTRUMENT_RUNTIME in the same script.
+  let directiveEnd = 0;
+  for (const statement of ast.body) {
+    const e = statement.expression;
+    if (statement.type !== 'ExpressionStatement' || !e || e.type !== 'Literal' ||
+        typeof e.value !== 'string' || statement.start !== e.start) break;
+    directiveEnd = statement.end;
+  }
+  return { ok:true, src:out, edit_count:kept.length,
+           runtime_insert_offset:directiveEnd, semantic_skips:semanticSkips };
 }
 """

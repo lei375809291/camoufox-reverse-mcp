@@ -399,6 +399,7 @@ async def _trace_property_access_impl(
         result["snapshot_values"] = snapshot["values"]
         result["values_skipped"] = snapshot["skipped"]
         result["values_semantics"] = "post-trace safe snapshot; not event-time values"
+        result["snapshot_context"] = snapshot.get("context")
         if snapshot.get("error"):
             result["values_error"] = snapshot["error"]
 
@@ -700,6 +701,8 @@ async def _collect_property_values(
 
     try:
         page = await browser_manager.get_active_page()
+        context = {"url": getattr(page, "url", None), "world": "isolated",
+                   "scope": "active_page_main_frame", "event_window_attribution": False}
         raw = await page.evaluate(js_code)
     except Exception as e:
         return {"values": {}, "skipped": skipped, "error": f"evaluate_js failed: {e}"}
@@ -722,4 +725,4 @@ async def _collect_property_values(
         else:
             values[path] = val
 
-    return {"values": values, "skipped": skipped}
+    return {"values": values, "skipped": skipped, "context": context}

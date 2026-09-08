@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections import deque
+from collections import Counter, deque
 
 from ..server import mcp, browser_manager
 from ..utils.frames import list_frame_metadata, persistent_frame_guard, resolve_frame
@@ -68,10 +68,13 @@ def _build_installer_core(
     world: str,
     install_id: str,
     watch_assignments: bool,
+    serialization: str = "json",
 ) -> str:
     """Build an async installer that returns an explicit success/failure record."""
     if mode == "intercept" and position not in {"before", "after", "replace"}:
         raise ValueError("position must be 'before', 'after', or 'replace'")
+    if mode == "trace" and serialization not in {"json", "preview"}:
+        raise ValueError("serialization must be 'json' or 'preview'")
 
     path_json = json.dumps(function_path)
     install_json = json.dumps(install_id)
@@ -100,51 +103,135 @@ def _build_installer_core(
     else:
         freeze_code = "parent[funcName] = wrapper;"
 
+    trace_runtime = ""
+    clock_expression = "Date.now()"
     if mode == "trace":
+        # One snapshot per realm, before replacing any trace target (including
+        # JSON.stringify/Date.now). Later trace installations reuse this snapshot.
+        trace_runtime = """
+    const __mcpTraceRuntime = __mcpState.traceRuntime || (__mcpState.traceRuntime = {
+        apply: Reflect.apply,
+        stringify: JSON.stringify, json: JSON,
+        now: Date.now, date: Date,
+        log: console.log, console,
+        string: String, substring: String.prototype.substring,
+        Error, isArray: Array.isArray,
+        logging: false, installations: 0
+    });
+        """
+        clock_expression = "__mcpTraceRuntime.apply(__mcpTraceRuntime.now, __mcpTraceRuntime.date, [])"
+        trace_frame_expression = frame_expression.replace(
+            "__mcpFrameMeta()", "__mcpTraceFrameMeta()"
+        ).replace("({...", "({__proto__: null, ...")
         wrapper_code = f"""
-        window.__mcp_traces = window.__mcp_traces || {{}};
-        window.__mcp_traces[path] = window.__mcp_traces[path] || [];
+        const runtime = __mcpTraceRuntime;
+        const installation = ++runtime.installations;
         let captureCount = 0;
         const maxCaptures = {max_captures};
+        const serialization = {json.dumps(serialization)};
+        const __mcpCut = (text, limit) => runtime.apply(runtime.substring, text, [0, limit]);
+        const __mcpEncode = value => runtime.apply(runtime.stringify, runtime.json, [value]);
+        const __mcpTraceFrameMeta = () => ({{
+            __proto__: null,
+            url: runtime.string(location.href), name: runtime.string(window.name || ''),
+            index: window === window.top ? 0 : null, is_main: window === window.top
+        }});
+        const __mcpPreview = value => {{
+            // No property reads, instanceof, enumeration, or object coercion.
+            switch (typeof value) {{
+                case 'object': return value === null ? null : '[object]';
+                case 'function': return '[function]';
+                case 'undefined': return '[undefined]';
+                case 'symbol': return '[symbol]';
+                case 'bigint': return '[bigint:' + runtime.string(value) + ']';
+                case 'number':
+                    if (value !== value) return '[NaN]';
+                    if (value === Infinity) return '[Infinity]';
+                    if (value === -Infinity) return '[-Infinity]';
+                    if (value === 0 && 1 / value === -Infinity) return '[-0]';
+            }}
+            return value;
+        }};
         const __mcpSafe = (value, limit) => {{
+            if (serialization === 'preview')
+                return __mcpCut(__mcpEncode(__mcpPreview(value)), limit);
             try {{
-                const encoded = JSON.stringify(value);
-                return encoded === undefined ? String(value).substring(0, limit)
-                    : encoded.substring(0, limit);
+                const encoded = __mcpEncode(value);
+                return __mcpCut(encoded === undefined ? runtime.string(value) : encoded, limit);
             }} catch(e) {{
-                try {{ return String(value).substring(0, limit); }}
+                try {{ return __mcpCut(runtime.string(value), limit); }}
                 catch(_) {{ return '[unserializable]'; }}
             }}
         }};
-        const wrapper = function(...args) {{
-            if (captureCount >= maxCaptures) return original.apply(this, args);
-            captureCount++;
-            const entry = {{
-                traceId: Date.now() + ':' + captureCount + ':' + Math.random().toString(36).slice(2),
-                callIndex: captureCount,
-                timestamp: Date.now(),
-                world: {json.dumps(world)},
-                frame: {frame_expression}
-            }};
-            if ({str(log_args).lower()}) entry.args = __mcpSafe(args, 2000);
-            if ({str(log_stack).lower()}) entry.stack = new Error().stack;
-            const result = original.apply(this, args);
-            if ({str(log_return).lower()}) entry.returnValue = __mcpSafe(result, 2000);
-            // Clearing retrieved traces must not disable an installed wrapper.
-            // Recording failures must not change the original function's result.
-            try {{
-                window.__mcp_traces = window.__mcp_traces || {{}};
-                if (!Array.isArray(window.__mcp_traces[path]))
-                    window.__mcp_traces[path] = [];
-                window.__mcp_traces[path].push(entry);
-            }} catch(e) {{}}
-            try {{
-                console.log('__MCP_TRACE__:' + JSON.stringify({{...entry, __path__: path}}));
-            }} catch(e) {{}}
-            try {{ console.log('[TRACE:' + path + ']', 'call #' + captureCount); }}
-            catch(e) {{}}
-            return result;
+        const __mcpArgs = args => {{
+            if (serialization === 'json') return __mcpSafe(args, 2000);
+            // Only inspect the wrapper-owned rest array; never serialize it or
+            // user objects, even if Array/Object.prototype has a toJSON hook.
+            let encoded = '[';
+            for (let i = 0; i < args.length && encoded.length < 2000; i++) {{
+                if (i) encoded += ',';
+                encoded += __mcpSafe(args[i], 2000);
+            }}
+            return __mcpCut(encoded + ']', 2000);
         }};
+        const __mcpRecord = (entry, threw, value) => {{
+            runtime.logging = true;
+            try {{
+                entry.outcome = threw ? 'throw' : 'return';
+                try {{
+                    if (threw) entry.thrownValue = __mcpSafe(value, 2000);
+                    else if ({str(log_return).lower()}) entry.returnValue = __mcpSafe(value, 2000);
+                }} catch(e) {{}}
+                // The page buffer and console cache are independent sinks.
+                // Clearing data must not reset the wrapper or its call counter.
+                try {{
+                    window.__mcp_traces = window.__mcp_traces || {{}};
+                    if (!runtime.isArray(window.__mcp_traces[path]))
+                        window.__mcp_traces[path] = [];
+                    const entries = window.__mcp_traces[path];
+                    entries[entries.length] = entry;
+                }} catch(e) {{}}
+                try {{
+                    runtime.apply(runtime.log, runtime.console, ['__MCP_TRACE__:' +
+                        __mcpEncode({{__proto__: null, ...entry, __path__: path}})]);
+                }} catch(e) {{}}
+                try {{
+                    runtime.apply(runtime.log, runtime.console,
+                        ['[TRACE:' + path + ']', 'call #' + entry.callIndex]);
+                }} catch(e) {{}}
+            }} catch(e) {{}}
+            finally {{ runtime.logging = false; }}
+        }};
+        const wrapper = (() => {{
+          // A strict wrapper preserves null/undefined/primitive receivers for
+          // strict originals. A directive inside a rest-parameter function is illegal.
+          'use strict';
+          return function(...args) {{
+            if (runtime.logging || captureCount >= maxCaptures)
+                return runtime.apply(original, this, args);
+            const entry = {{
+                __proto__: null,
+                traceId: {install_json} + ':' + installation + ':' + (++captureCount),
+                callIndex: captureCount, serialization, completion: 'sync',
+                world: {json.dumps(world)},
+            }};
+            runtime.logging = true;
+            try {{
+                try {{ entry.timestamp = runtime.apply(runtime.now, runtime.date, []); }} catch(e) {{}}
+                try {{ entry.frame = {trace_frame_expression}; }} catch(e) {{}}
+                try {{ if ({str(log_args).lower()}) entry.args = __mcpArgs(args); }} catch(e) {{}}
+                try {{ if ({str(log_stack).lower()}) entry.stack = new runtime.Error().stack; }} catch(e) {{}}
+            }} finally {{ runtime.logging = false; }}
+            // The guard covers logging only: real nested/recursive calls are traced.
+            // Never await, read .then, or attach handlers to the returned value.
+            let result, threw = false;
+            try {{ result = runtime.apply(original, this, args); }}
+            catch(value) {{ result = value; threw = true; }}
+            __mcpRecord(entry, threw, result);
+            if (threw) throw result;
+            return result;
+          }};
+        }})();
         try {{ Object.defineProperty(wrapper, 'name', {{ value: funcName }}); }} catch(e) {{}}
         try {{ Object.defineProperty(wrapper, 'length', {{ value: original.length }}); }} catch(e) {{}}
         wrapper.toString = function() {{ return original.toString(); }};
@@ -198,6 +285,7 @@ def _build_installer_core(
     }}
     const __mcpState = window.__mcp_function_hook_state
         || (window.__mcp_function_hook_state = {{records: [], pending: []}});
+    {trace_runtime}
     window.__mcp_function_uninstall = () => {{
         const result = {{restored: [], errors: [], cancelled: 0}};
         for (const pending of __mcpState.pending.splice(0)) {{
@@ -349,13 +437,13 @@ def _build_installer_core(
     }};
     __mcpPending = {{cancelled: false, cleanup: __mcpCleanupWatchers}};
     __mcpState.pending.push(__mcpPending);
-    const deadline = Date.now() + {wait_timeout_ms};
+    const deadline = {clock_expression} + {wait_timeout_ms};
     try {{
         const initial = __mcpTryInstall();
         if (initial.ok || initial.error) return initial;
         if (initial.missingParent) __mcpArmWatcher(initial.missingParent, initial.missingKey);
         while (true) {{
-            if (Date.now() >= deadline) {{
+            if ({clock_expression} >= deadline) {{
                 return {{ ok: false, error: 'target_not_found', target: path,
                     waited_ms: {wait_timeout_ms}, frame: __mcpFrameMeta() }};
             }}
@@ -415,6 +503,7 @@ async def hook_function(
     frame_url: str | None = None,
     frame_name: str | None = None,
     frame_index: int | None = None,
+    serialization: str = "json",
 ) -> dict:
     """Hook or trace a function (v0.9.0 unified).
 
@@ -426,8 +515,8 @@ async def hook_function(
         mode:
           "intercept" — inject custom JS before/after/replace the function.
                         Requires hook_code. (was: hook_function)
-          "trace"     — non-invasive trace logging args, return values,
-                        and optionally call stacks. (was: trace_function)
+          "trace"     — log synchronous returns/throws and optionally args and
+                        call stacks. (was: trace_function)
         hook_code: JS code for "intercept" mode. Context vars:
             - arguments: original args
             - __this: the 'this' context
@@ -449,6 +538,31 @@ async def hook_function(
         frame_url: Optional exact frame URL or shell-style wildcard.
         frame_name: Optional exact frame name or shell-style wildcard.
         frame_index: Optional zero-based index from get_page_info().frames.
+        serialization: For "trace": "json" (default) retains JSON text fields,
+            but executes getters/toJSON and may fall back to String conversion;
+            this can have side effects. "preview" reads no properties of argument,
+            return, or thrown objects and never coerces them: objects/functions
+            are placeholders, symbols omit their description, and undefined,
+            BigInt, NaN, infinities and -0 have string tags. Only the wrapper's
+            own argument array is traversed. Text is truncated at 2000 characters
+            in both modes and is not necessarily complete/parseable JSON.
+
+    Trace semantics:
+        Ordinary synchronous calls keep the original receiver, argument values,
+        return/throw identity and one original invocation. Entries retain traceId,
+        callIndex, timestamp, world, frame, args/returnValue and optional stack;
+        outcome is "return" or "throw", with thrownValue for synchronous throws.
+        completion="sync" always: a returned Promise/thenable is only a synchronous
+        return, never an observed settlement (no await or attached handlers).
+        Logging failures do not replace the original result/exception. Calls made
+        by logging/JSON serialization are not recursively traced; real nested
+        calls are. Clearing logs does not reset max_captures or callIndex.
+        Intrinsics are saved at the first trace installation in each realm, so
+        later hooks cannot redirect the logger. Already modified third-party
+        intrinsics cannot be recovered. Preview limits value inspection, not
+        timing/stack/identity visibility of wrappers or page-controlled sinks;
+        optional stack capture may run custom stack formatting. Constructor/new
+        semantics are outside this ordinary-call trace contract.
 
     Returns:
         dict with status, target, mode.
@@ -462,6 +576,8 @@ async def hook_function(
             return {"error": "function_path must be non-empty"}
         if mode == "trace" and (isinstance(max_captures, bool) or max_captures < 1):
             return {"error": "max_captures must be at least 1"}
+        if mode == "trace" and serialization not in {"json", "preview"}:
+            return {"error": "serialization must be 'json' or 'preview'"}
         if persistent and frame_index is not None:
             return {
                 "error": (
@@ -506,6 +622,7 @@ async def hook_function(
                 "log_stack": log_stack,
                 "max_captures": max_captures,
                 "watch_assignments": watch_late,
+                **({"serialization": serialization} if mode == "trace" else {}),
             },
             sort_keys=True,
         )
@@ -528,6 +645,7 @@ async def hook_function(
             world=world,
             install_id=install_id,
             watch_assignments=watch_late,
+            serialization=serialization,
         )
 
         persistent_registered = False
@@ -550,6 +668,7 @@ async def hook_function(
                 world=world,
                 install_id=install_id,
                 watch_assignments=watch_late,
+                serialization=serialization,
             )
             persistent_js = _wrap_installer_world(persistent_core, world)
             script_name = f"hook:{install_id}"
@@ -577,6 +696,7 @@ async def hook_function(
             result = {
                 "target": function_path,
                 "mode": mode,
+                **({"serialization": serialization} if mode == "trace" else {}),
                 "world": world,
                 "persistent": persistent,
                 "persistent_registered": persistent_registered,
@@ -603,6 +723,7 @@ async def hook_function(
             "install_state": "installed",
             "target": function_path,
             "mode": mode,
+            **({"serialization": serialization} if mode == "trace" else {}),
             "position": position if mode == "intercept" else None,
             "non_overridable": non_overridable if mode == "intercept" else None,
             "persistent": persistent,
@@ -674,6 +795,10 @@ async def get_trace_data(
     The Python-side cache is the authoritative source after reload/navigation.
     Every new trace entry includes ``frame`` metadata (URL, name, best-effort
     index, and main-frame flag).
+    Trace IDs use installation/call counters, without page randomness. They are
+    local to a realm: frames/reloads may repeat IDs and even complete entries.
+    Merge the two sinks as multisets of full entries, removing only one cached
+    copy per matching live copy. Repetitions within either sink are preserved.
     """
     try:
         if world not in {"isolated", "main"}:
@@ -727,11 +852,11 @@ async def get_trace_data(
                 if function_path is not None and path != function_path:
                     continue
                 destination = merged.setdefault(path, [])
-                seen = {
-                    entry.get("traceId") or json.dumps(entry, sort_keys=True, default=str)
+                live_copies = Counter(
+                    json.dumps(entry, sort_keys=True, default=str)
                     for entry in destination
                     if isinstance(entry, dict)
-                }
+                )
                 for raw_entry in entries:
                     if not isinstance(raw_entry, dict):
                         continue
@@ -744,10 +869,11 @@ async def get_trace_data(
                         frame_index=frame_index,
                     ):
                         continue
-                    key = entry.get("traceId") or json.dumps(entry, sort_keys=True, default=str)
-                    if key not in seen:
+                    key = json.dumps(entry, sort_keys=True, default=str)
+                    if live_copies[key]:
+                        live_copies[key] -= 1
+                    else:
                         destination.append(entry)
-                        seen.add(key)
 
         if frame_url is not None or frame_name is not None or frame_index is not None:
             for path, entries in list(merged.items()):

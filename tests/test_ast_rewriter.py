@@ -16,7 +16,7 @@ def test_method_call_rewrite():
     out, stats = ast_rewrite(src, tag="test")
     assert out is not None
     assert stats["method_edits"] >= 1
-    assert "__mcp_tap_method(document" in out
+    assert "__mcp_prepare_method(document" in out
 
 
 def test_plain_call_rewrite():
